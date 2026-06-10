@@ -319,13 +319,16 @@ export async function upsertUsers(
       .first<{ id: string }>();
     if (existing) {
       updated++;
+      // dest_upn changes are deliberately not applied here: remapping a user's
+      // destination must reset their orchestrator state (id map/delta cursors
+      // reference the old mailbox), which the API layer handles explicitly.
       stmts.push(
         db
           .prepare(
-            `UPDATE migration_users SET dest_upn = ?, display_name = COALESCE(?, display_name),
+            `UPDATE migration_users SET display_name = COALESCE(?, display_name),
              source_id = COALESCE(?, source_id), updated_at = ? WHERE id = ?`
           )
-          .bind(r.destUpn.toLowerCase(), r.displayName ?? null, r.sourceId ?? null, now, existing.id)
+          .bind(r.displayName ?? null, r.sourceId ?? null, now, existing.id)
       );
     } else {
       added++;
@@ -421,8 +424,10 @@ export async function updateUserStatus(
     startedAt?: string;
     completedAt?: string | null;
     sourceId?: string;
-    destId?: string;
+    destId?: string | null;
+    destUpn?: string;
     displayName?: string;
+    stats?: UserStats;
   }
 ): Promise<void> {
   const sets: string[] = ['updated_at = ?'];
@@ -459,9 +464,17 @@ export async function updateUserStatus(
     sets.push('dest_id = ?');
     binds.push(patch.destId);
   }
+  if (patch.destUpn !== undefined) {
+    sets.push('dest_upn = ?');
+    binds.push(patch.destUpn.toLowerCase());
+  }
   if (patch.displayName !== undefined) {
     sets.push('display_name = ?');
     binds.push(patch.displayName);
+  }
+  if (patch.stats !== undefined) {
+    sets.push('stats = ?');
+    binds.push(JSON.stringify(patch.stats));
   }
   binds.push(userId);
   await db.prepare(`UPDATE migration_users SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();

@@ -441,6 +441,7 @@ async function tabUsers(c, project) {
 
 async function userDetailModal(project, userId) {
   const { user, recentErrors } = await api('GET', `/api/projects/${project.id}/users/${userId}`);
+  const canEdit = user.status !== 'running' && user.status !== 'queued';
   const wlRows = Object.entries(user.stats || {}).map(([w, st]) => `
     <tr><td>${esc(WORKLOAD_LABELS[w] || w)}</td>
     <td class="right mono">${st.discovered || 0}</td><td class="right mono">${st.migrated || 0}</td>
@@ -452,7 +453,7 @@ async function userDetailModal(project, userId) {
   const m = modal(`
     <h2>${esc(user.sourceUpn)} ${pill(user.status)}</h2>
     <dl class="kv">
-      <dt>Destination</dt><dd class="mono">${esc(user.destUpn)}</dd>
+      <dt>Destination</dt><dd class="mono" id="ud-dest-row">${esc(user.destUpn)}${canEdit ? ' <button class="small" id="ud-edit-dest">Edit</button>' : ''}</dd>
       <dt>Last pass</dt><dd>${esc(user.passType || '—')}</dd>
       <dt>Started</dt><dd>${fmtDate(user.startedAt)}</dd>
       <dt>Completed</dt><dd>${fmtDate(user.completedAt)}</dd>
@@ -469,6 +470,36 @@ async function userDetailModal(project, userId) {
       <button id="ud-close">Close</button>
     </div>`, { wide: true });
   m.querySelector('#ud-close').addEventListener('click', closeModal);
+  const editBtn = m.querySelector('#ud-edit-dest');
+  if (editBtn) editBtn.addEventListener('click', () => {
+    const row = m.querySelector('#ud-dest-row');
+    row.innerHTML = `
+      <input id="ud-dest-input" class="mono" value="${esc(user.destUpn)}" style="max-width:300px;display:inline-block;width:auto" />
+      <button class="small primary" id="ud-dest-save">Save</button>
+      <button class="small" id="ud-dest-cancel">Cancel</button>`;
+    const input = row.querySelector('#ud-dest-input');
+    input.focus();
+    row.querySelector('#ud-dest-cancel').addEventListener('click', () => {
+      closeModal(); userDetailModal(project, userId);
+    });
+    const save = async () => {
+      const destUpn = input.value.trim().toLowerCase();
+      if (!destUpn.includes('@')) return toast('Enter a full UPN (user@domain)', 'error');
+      if (destUpn === user.destUpn) { closeModal(); userDetailModal(project, userId); return; }
+      const hasHistory = user.startedAt || Object.keys(user.stats || {}).length > 0;
+      if (hasHistory && !confirm(
+        'Changing the destination resets this user\'s migration state (id map and delta cursors). ' +
+        'Items already copied to the old mailbox stay there, and the next pass re-copies everything ' +
+        'to the new destination. Continue?')) return;
+      try {
+        await api('PATCH', `/api/projects/${project.id}/users/${userId}`, { destUpn });
+        toast(`Destination changed to ${destUpn}`, 'ok');
+        closeModal(); userDetailModal(project, userId);
+      } catch (e) { toast(e.message, 'error'); }
+    };
+    row.querySelector('#ud-dest-save').addEventListener('click', save);
+    input.addEventListener('keydown', (e) => { if (e.key === 'Enter') save(); });
+  });
   const stopBtn = m.querySelector('#ud-stop');
   if (stopBtn) stopBtn.addEventListener('click', async () => {
     try { await api('POST', `/api/projects/${project.id}/stop`, { userIds: [userId] }); closeModal(); toast('Stop requested', 'ok'); }
@@ -526,7 +557,8 @@ async function discoverModal(project) {
           users: picked.map((u) => ({ sourceUpn: u.userPrincipalName, displayName: u.displayName, sourceId: u.id })),
         },
       });
-      closeModal(); toast(`Added ${res.added}, updated ${res.updated}`, 'ok');
+      closeModal();
+      toast(`Added ${res.added}, updated ${res.updated}${res.remapped ? `, remapped ${res.remapped}` : ''}${res.conflicts?.length ? ` — ${res.conflicts.length} skipped (active migration)` : ''}`, 'ok');
       viewProject(project.id, 'users');
     } catch (e) { toast(e.message, 'error'); }
   });
@@ -543,7 +575,7 @@ function importCsvModal(project) {
     try {
       const res = await api('POST', `/api/projects/${project.id}/users/import`, m.querySelector('#csv').value, { raw: true, contentType: 'text/csv' });
       closeModal();
-      toast(`Imported: ${res.added} added, ${res.updated} updated${res.parseErrors?.length ? `, ${res.parseErrors.length} line(s) skipped` : ''}`, 'ok');
+      toast(`Imported: ${res.added} added, ${res.updated} updated${res.remapped ? `, ${res.remapped} remapped` : ''}${res.conflicts?.length ? `, ${res.conflicts.length} skipped (active migration)` : ''}${res.parseErrors?.length ? `, ${res.parseErrors.length} line(s) invalid` : ''}`, 'ok');
       viewProject(project.id, 'users');
     } catch (e) { toast(e.message, 'error'); }
   });

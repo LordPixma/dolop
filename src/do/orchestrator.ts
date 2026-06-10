@@ -131,6 +131,8 @@ export class MigrationOrchestrator extends DurableObject<Env> {
           return await this.handleStop();
         case '/resume':
           return await this.handleResume();
+        case '/reset':
+          return await this.handleReset();
         case '/status':
           return Response.json({
             job: this.store.getJson<JobState>('sys:job'),
@@ -249,6 +251,23 @@ export class MigrationOrchestrator extends DurableObject<Env> {
       // takes effect promptly.
       await this.ctx.storage.setAlarm(Date.now() + 50);
     }
+    return Response.json({ ok: true });
+  }
+
+  /**
+   * Wipe all migration state (id map, delta cursors, pass progress). Called
+   * when the user's destination mapping changes — stale state would point at
+   * the old destination mailbox. Refused while a pass is actively running.
+   */
+  private async handleReset(): Promise<Response> {
+    const alarm = await this.ctx.storage.getAlarm();
+    const active =
+      alarm !== null && this.store.getJson('sys:job') !== null && this.store.getRaw('sys:done') !== '1';
+    if (active) {
+      return Response.json({ error: 'a pass is running — stop it before remapping' }, { status: 409 });
+    }
+    await this.ctx.storage.deleteAlarm();
+    this.store.wipe();
     return Response.json({ ok: true });
   }
 

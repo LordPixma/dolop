@@ -172,4 +172,15 @@ export class EngineStore {
     this.sql.exec(`DELETE FROM kv WHERE k LIKE 'phase:%' OR k LIKE 'state:%'`);
     this.sql.exec('DELETE FROM work');
   }
+
+  /**
+   * Erase everything — id map, delta cursors, pass state. Used when a user's
+   * destination mailbox changes: stale mappings would otherwise make later
+   * passes skip items that were never copied to the new destination.
+   */
+  wipe(): void {
+    this.sql.exec('DELETE FROM kv');
+    this.sql.exec('DELETE FROM idmap');
+    this.sql.exec('DELETE FROM work');
+  }
 }

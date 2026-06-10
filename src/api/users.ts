@@ -3,14 +3,86 @@
 // (user creation + license assignment), and per-user detail.
 
 import { Hono } from 'hono';
-import { deleteUser, getUser, listItemErrors, listUsers, updateUserStatus, upsertUsers } from '../db';
+import {
+  deleteUser,
+  getUser,
+  listAllProjectUsers,
+  listItemErrors,
+  listUsers,
+  logEvent,
+  updateUserStatus,
+  upsertUsers,
+} from '../db';
 import { GraphError } from '../graph/client';
 import type { GraphUser, SubscribedSku } from '../graph/types';
-import type { Env } from '../types';
+import type { Env, MigrationUser } from '../types';
 import { mapUpnToDomain, parseMappingCsv } from '../util';
 import { ApiError, generatePassword, graphForConnector, loadProject } from './helpers';
 
 export const usersApi = new Hono<{ Bindings: Env }>();
+
+/**
+ * Change a user's destination UPN. The orchestrator's id map and delta cursors
+ * reference the old destination mailbox, so they are wiped — the next pass
+ * starts fresh against the new mailbox instead of silently skipping items.
+ */
+async function changeDestUpn(
+  env: Env,
+  projectId: string,
+  user: MigrationUser,
+  newDestUpn: string
+): Promise<void> {
+  const stub = env.ORCHESTRATOR.get(env.ORCHESTRATOR.idFromName(`${projectId}/${user.id}`));
+  const res = await stub.fetch('https://do/reset', { method: 'POST', body: '{}' });
+  if (!res.ok) {
+    const detail = ((await res.json().catch(() => ({}))) as { error?: string }).error;
+    throw new ApiError(409, detail ?? 'could not reset migration state for remapping');
+  }
+  await updateUserStatus(env.DB, user.id, {
+    destUpn: newDestUpn,
+    destId: null,
+    status: 'pending',
+    error: null,
+    completedAt: null,
+    stats: {},
+  });
+  await logEvent(env.DB, {
+    projectId,
+    userId: user.id,
+    message: `destination remapped ${user.destUpn} → ${newDestUpn.toLowerCase()} (migration state reset)`,
+  });
+}
+
+/**
+ * Apply mapping rows: new users are inserted; existing users whose destination
+ * changed are remapped (with state reset) unless a pass is active for them.
+ */
+async function applyMappings(
+  env: Env,
+  projectId: string,
+  rows: { sourceUpn: string; destUpn: string; displayName?: string; sourceId?: string }[]
+): Promise<{ added: number; updated: number; remapped: number; conflicts: string[] }> {
+  const existing = new Map(
+    (await listAllProjectUsers(env.DB, projectId)).map((u) => [u.sourceUpn, u])
+  );
+  const upserts: typeof rows = [];
+  let remapped = 0;
+  const conflicts: string[] = [];
+  for (const row of rows) {
+    const user = existing.get(row.sourceUpn.toLowerCase());
+    if (user && user.destUpn !== row.destUpn.toLowerCase()) {
+      if (user.status === 'running' || user.status === 'queued') {
+        conflicts.push(`${row.sourceUpn}: migration active — destination left as ${user.destUpn}`);
+        continue;
+      }
+      await changeDestUpn(env, projectId, user, row.destUpn);
+      remapped++;
+    }
+    upserts.push(row);
+  }
+  const result = await upsertUsers(env.DB, projectId, upserts);
+  return { ...result, remapped, conflicts };
+}
 
 // Discover users in the source tenant (optionally filtered with an OData $filter).
 usersApi.post('/:projectId/discover', async (c) => {
@@ -67,8 +139,7 @@ usersApi.post('/:projectId/users', async (c) => {
   if (rows.length === 0) {
     throw new ApiError(400, 'provide mappings[] or autoMap{targetDomain, users[]}');
   }
-  const result = await upsertUsers(c.env.DB, project.id, rows);
-  return c.json(result);
+  return c.json(await applyMappings(c.env, project.id, rows));
 });
 
 // CSV import: "sourceUpn,destUpn" per line (optional header).
@@ -79,8 +150,32 @@ usersApi.post('/:projectId/users/import', async (c) => {
   if (rows.length === 0) {
     return c.json({ error: 'no valid rows found', parseErrors: errors }, 400);
   }
-  const result = await upsertUsers(c.env.DB, project.id, rows);
+  const result = await applyMappings(c.env, project.id, rows);
   return c.json({ ...result, parseErrors: errors });
+});
+
+// Edit a user's mapping. Changing destUpn resets that user's migration state
+// (id map + delta cursors) so the next pass fully re-copies to the new mailbox.
+usersApi.patch('/:projectId/users/:userId', async (c) => {
+  const project = await loadProject(c.env, c.req.param('projectId'));
+  const user = await getUser(c.env.DB, c.req.param('userId'));
+  if (!user || user.projectId !== project.id) throw new ApiError(404, 'user not found');
+  const body = (await c.req.json().catch(() => ({}))) as { destUpn?: string; displayName?: string };
+
+  if (body.destUpn !== undefined) {
+    const destUpn = body.destUpn.trim().toLowerCase();
+    if (!destUpn.includes('@')) throw new ApiError(400, 'destUpn must be a full UPN (user@domain)');
+    if (user.status === 'running' || user.status === 'queued') {
+      throw new ApiError(409, 'stop the migration for this user before changing the destination');
+    }
+    if (destUpn !== user.destUpn) {
+      await changeDestUpn(c.env, project.id, user, destUpn);
+    }
+  }
+  if (body.displayName !== undefined) {
+    await updateUserStatus(c.env.DB, user.id, { displayName: body.displayName });
+  }
+  return c.json({ user: await getUser(c.env.DB, user.id) });
 });
 
 usersApi.get('/:projectId/users', async (c) => {

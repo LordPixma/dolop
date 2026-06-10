@@ -1,4 +1,4 @@
-# dolop
+# Dolop
 
 **Open-source Microsoft 365 tenant-to-tenant migration, built entirely on Cloudflare.**
 
@@ -6,9 +6,7 @@
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Cloudflare Workers](https://img.shields.io/badge/runs%20on-Cloudflare%20Workers-f38020)](https://workers.cloudflare.com/)
 
-Dolop migrates user accounts between Microsoft 365 tenants — the job commercial tools like
-BitTitan MigrationWiz charge per-user licences for — using nothing but the Cloudflare
-developer platform and the Microsoft Graph API. No servers, no VMs, no agents: the entire
+Dolop migrates user accounts between Microsoft 365 tenants — the job commercial tools like charge per-user licences for — using nothing but the Cloudflare developer platform and the Microsoft Graph API. No servers, no VMs, no agents: the entire
 migration engine runs in Workers and Durable Objects, and you self-host it on your own
 Cloudflare account for pennies.
 

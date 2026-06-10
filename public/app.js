@@ -527,49 +527,84 @@ function newConnectorModal() {
 let pollTimer = null;
 function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
 
-async function viewProject(projectId, tab = 'users') {
-  stopPolling();
-  let data;
-  try { data = await api('GET', `/api/projects/${projectId}`); }
-  catch (e) { $app.innerHTML = `<div class="empty">${esc(e.message)}</div>`; return; }
-  const { project, userSummary, sourceConnector, destConnector } = data;
-  const s = userSummary || {};
-  const total = Object.values(s).reduce((a, b) => a + b, 0);
+let renderingProject = false;
 
-  const tabs = ['users', 'migrate', 'errors', 'events', 'settings'];
-  $app.innerHTML = `
-    <div class="page-head">
-      <div>
-        <h1>${esc(project.name)}</h1>
-        <div class="sub">
-          ${sourceConnector ? esc(sourceConnector.name) : '<em>no source</em>'} →
-          ${destConnector ? esc(destConnector.name) : '<em>no destination</em>'}
+/**
+ * Fetch all data first, build the new view in a detached node, then swap the
+ * DOM in one synchronous step — background refreshes never show "Loading…"
+ * or drop checkbox/scroll state.
+ */
+async function renderProject(projectId, tab) {
+  if (renderingProject) return;
+  renderingProject = true;
+  try {
+    const data = await api('GET', `/api/projects/${projectId}`);
+    const { project, userSummary, sourceConnector, destConnector } = data;
+    const s = userSummary || {};
+    const total = Object.values(s).reduce((a, b) => a + b, 0);
+
+    const content = document.createElement('div');
+    content.id = 'tab-content';
+    if (tab === 'users') await tabUsers(content, project);
+    else if (tab === 'migrate') await tabMigrate(content, project);
+    else if (tab === 'errors') await tabErrors(content, project);
+    else if (tab === 'events') await tabEvents(content, project);
+    else await tabSettings(content, project, data);
+
+    // Preserve volatile UI state across background refreshes.
+    const prevSel = new Set([...document.querySelectorAll('[data-sel]:checked')].map((x) => x.dataset.sel));
+    const prevSelAll = document.getElementById('sel-all')?.checked ?? false;
+    const scrollY = window.scrollY;
+
+    const tabs = ['users', 'migrate', 'errors', 'events', 'settings'];
+    $app.innerHTML = `
+      <div class="page-head">
+        <div>
+          <h1>${esc(project.name)}</h1>
+          <div class="sub">
+            ${sourceConnector ? esc(sourceConnector.name) : '<em>no source</em>'} →
+            ${destConnector ? esc(destConnector.name) : '<em>no destination</em>'}
+          </div>
+        </div>
+        <div class="statrow">
+          <div class="stat"><div class="n">${total}</div><div class="l">users</div></div>
+          <div class="stat"><div class="n">${s.running || 0}</div><div class="l">running</div></div>
+          <div class="stat"><div class="n">${(s.completed || 0) + (s.completed_with_errors || 0)}</div><div class="l">done</div></div>
+          <div class="stat"><div class="n" style="color:${(s.failed || 0) ? 'var(--red)' : 'inherit'}">${s.failed || 0}</div><div class="l">failed</div></div>
         </div>
       </div>
-      <div class="statrow">
-        <div class="stat"><div class="n">${total}</div><div class="l">users</div></div>
-        <div class="stat"><div class="n">${s.running || 0}</div><div class="l">running</div></div>
-        <div class="stat"><div class="n">${(s.completed || 0) + (s.completed_with_errors || 0)}</div><div class="l">done</div></div>
-        <div class="stat"><div class="n" style="color:${(s.failed || 0) ? 'var(--red)' : 'inherit'}">${s.failed || 0}</div><div class="l">failed</div></div>
+      <div class="tabs">
+        ${tabs.map((t) => `<a href="#/projects/${project.id}/${t}" class="${t === tab ? 'active' : ''}">${t[0].toUpperCase() + t.slice(1)}</a>`).join('')}
       </div>
-    </div>
-    <div class="tabs">
-      ${tabs.map((t) => `<a href="#/projects/${project.id}/${t}" class="${t === tab ? 'active' : ''}">${t[0].toUpperCase() + t.slice(1)}</a>`).join('')}
-    </div>
-    <div id="tab-content"><div class="loading">Loading…</div></div>`;
+      <div id="tab-content"></div>`;
+    document.getElementById('tab-content').replaceWith(content);
 
-  const c = document.getElementById('tab-content');
-  if (tab === 'users') await tabUsers(c, project);
-  else if (tab === 'migrate') await tabMigrate(c, project);
-  else if (tab === 'errors') await tabErrors(c, project);
-  else if (tab === 'events') await tabEvents(c, project);
-  else await tabSettings(c, project, data);
+    if (prevSel.size) {
+      content.querySelectorAll('[data-sel]').forEach((x) => { if (prevSel.has(x.dataset.sel)) x.checked = true; });
+    }
+    if (prevSelAll) {
+      const sa = content.querySelector('#sel-all');
+      if (sa) sa.checked = true;
+    }
+    window.scrollTo(0, scrollY);
+  } finally {
+    renderingProject = false;
+  }
+}
 
+async function viewProject(projectId, tab = 'users') {
+  stopPolling();
+  try {
+    await renderProject(projectId, tab);
+  } catch (e) {
+    if (e.message !== 'unauthorized') $app.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+    return;
+  }
   if (tab === 'users' || tab === 'migrate') {
     pollTimer = setInterval(async () => {
       if (document.getElementById('modal-root').innerHTML !== '') return; // don't refresh under a modal
-      if (location.hash.indexOf(`#/projects/${projectId}`) !== 0) { stopPolling(); return; }
-      try { await viewProject(projectId, tab); } catch { /* transient */ }
+      if (!location.hash.startsWith(`#/projects/${projectId}`)) { stopPolling(); return; }
+      try { await renderProject(projectId, tab); } catch { /* transient — keep current view */ }
     }, 6000);
   }
 }

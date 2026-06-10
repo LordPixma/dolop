@@ -1,0 +1,85 @@
+// Dolop — Cloudflare-native M365 tenant-to-tenant migration platform.
+//
+// Before first deploy:
+//   1. wrangler d1 create dolop                 → paste database_id below
+//   2. wrangler kv namespace create KV          → paste id below
+//   3. wrangler r2 bucket create dolop-artifacts
+//   4. wrangler queues create dolop-migrations
+//   5. wrangler queues create dolop-dlq
+//   6. wrangler secret put ENCRYPTION_KEY       (openssl rand -base64 32)
+//   7. wrangler secret put API_TOKEN            (openssl rand -hex 32)
+//   8. npm run db:migrate
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "dolop",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "dolop",
+      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "KV",
+      "id": "REPLACE_WITH_KV_NAMESPACE_ID"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "R2",
+      "bucket_name": "dolop-artifacts"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "MIGRATION_QUEUE",
+        "queue": "dolop-migrations"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "dolop-migrations",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "dead_letter_queue": "dolop-dlq"
+      }
+    ]
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ORCHESTRATOR",
+        "class_name": "MigrationOrchestrator"
+      },
+      {
+        "name": "COORDINATOR",
+        "class_name": "ProjectCoordinator"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["MigrationOrchestrator", "ProjectCoordinator"]
+    }
+  ],
+  "triggers": {
+    "crons": ["*/15 * * * *"]
+  },
+  "observability": {
+    "enabled": true
+  }
+}

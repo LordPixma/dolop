@@ -1,0 +1,25 @@
+{
+  "name": "dolop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cloudflare-native Microsoft 365 tenant-to-tenant migration platform",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "db:migrate": "wrangler d1 migrations apply dolop --remote",
+    "db:migrate:local": "wrangler d1 migrations apply dolop --local"
+  },
+  "dependencies": {
+    "hono": "^4.6.14"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20251001.0",
+    "typescript": "^5.7.2",
+    "vitest": "^3.0.5",
+    "wrangler": "^4.0.0"
+  }
+}

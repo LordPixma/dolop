@@ -1,0 +1,183 @@
+// Shared domain types and Worker environment bindings.
+
+export interface Env {
+  DB: D1Database;
+  KV: KVNamespace;
+  R2: R2Bucket;
+  MIGRATION_QUEUE: Queue<QueueMessage>;
+  ORCHESTRATOR: DurableObjectNamespace;
+  COORDINATOR: DurableObjectNamespace;
+  ASSETS: Fetcher;
+  /** base64-encoded 32-byte AES-256-GCM master key (wrangler secret) */
+  ENCRYPTION_KEY: string;
+  /** bearer token protecting the API (wrangler secret) */
+  API_TOKEN: string;
+}
+
+export type Workload = 'mail' | 'calendar' | 'contacts' | 'tasks' | 'drive' | 'rules';
+
+export const ALL_WORKLOADS: Workload[] = ['mail', 'calendar', 'contacts', 'tasks', 'drive', 'rules'];
+
+export type PassType = 'assessment' | 'prestage' | 'full' | 'delta';
+
+export interface PassFilters {
+  /** Pre-stage cutoff: only migrate mail received on/before this ISO date. */
+  mailReceivedBefore?: string;
+  /** Only migrate mail received on/after this ISO date. */
+  mailReceivedAfter?: string;
+  /** Folder display-name paths to exclude, e.g. "Inbox/Newsletters". Case-insensitive. */
+  excludeFolders?: string[];
+  excludeDeletedItems?: boolean;
+  excludeJunk?: boolean;
+  /**
+   * 'strip' (default): attendees are removed from migrated events so the destination
+   * tenant never sends meeting invitations; the original attendee list is preserved
+   * in an open extension (com.dolop.migration) on each event.
+   * 'preserve': attendees are kept — Exchange Online may send invitation mail.
+   */
+  calendarAttendees?: 'strip' | 'preserve';
+  /** Drive paths (relative to root, e.g. "Archive/Old") to exclude. Case-insensitive prefix match. */
+  driveExcludePaths?: string[];
+}
+
+export interface PassConfig {
+  passType: PassType;
+  workloads: Workload[];
+  filters: PassFilters;
+}
+
+export interface ProjectSettings {
+  /** How many users migrate concurrently (BitTitan-style concurrency control). */
+  maxConcurrentUsers: number;
+  defaultWorkloads: Workload[];
+  /** When true, the cron trigger schedules delta passes for completed users. */
+  autoDeltaEnabled?: boolean;
+  /** Minimum minutes between automatic delta passes (default 240). */
+  autoDeltaIntervalMinutes?: number;
+  notes?: string;
+}
+
+export const DEFAULT_PROJECT_SETTINGS: ProjectSettings = {
+  maxConcurrentUsers: 10,
+  defaultWorkloads: [...ALL_WORKLOADS],
+  autoDeltaEnabled: false,
+  autoDeltaIntervalMinutes: 240,
+};
+
+export type UserStatus =
+  | 'pending'
+  | 'queued'
+  | 'running'
+  | 'completed'
+  | 'completed_with_errors'
+  | 'failed'
+  | 'stopped';
+
+export interface WorkloadStats {
+  discovered: number;
+  migrated: number;
+  skipped: number;
+  failed: number;
+  bytes: number;
+}
+
+export function emptyWorkloadStats(): WorkloadStats {
+  return { discovered: 0, migrated: 0, skipped: 0, failed: 0, bytes: 0 };
+}
+
+/** Per-user stats keyed by workload (plus 'assessment'). */
+export type UserStats = Record<string, WorkloadStats>;
+
+export interface Connector {
+  id: string;
+  name: string;
+  tenantId: string;
+  clientId: string;
+  /** decrypted only when needed; never returned by the API */
+  clientSecret?: string;
+  verifyStatus: 'unverified' | 'ok' | 'failed';
+  verifyDetail?: string;
+  lastVerifiedAt?: string;
+  createdAt: string;
+}
+
+export interface Project {
+  id: string;
+  name: string;
+  description?: string;
+  sourceConnectorId?: string;
+  destConnectorId?: string;
+  settings: ProjectSettings;
+  status: 'active' | 'archived';
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MigrationUser {
+  id: string;
+  projectId: string;
+  sourceUpn: string;
+  destUpn: string;
+  sourceId?: string;
+  destId?: string;
+  displayName?: string;
+  status: UserStatus;
+  passType?: PassType;
+  passConfig?: PassConfig;
+  stats: UserStats;
+  error?: string;
+  heartbeatAt?: string;
+  startedAt?: string;
+  completedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ItemError {
+  id: number;
+  projectId: string;
+  userId: string;
+  workload: string;
+  itemType?: string;
+  itemId?: string;
+  itemName?: string;
+  code?: string;
+  message?: string;
+  createdAt: string;
+}
+
+export interface TenantCredentials {
+  tenantId: string;
+  clientId: string;
+  clientSecret: string;
+}
+
+// ---------------------------------------------------------------------------
+// Queue messages
+
+export type QueueMessage =
+  | {
+      type: 'enqueue-users';
+      projectId: string;
+      userIds: string[];
+      pass: PassConfig;
+    }
+  | {
+      type: 'auto-delta';
+      projectId: string;
+    };
+
+// ---------------------------------------------------------------------------
+// Durable Object RPC payloads (sent over fetch)
+
+export interface OrchestratorStartBody {
+  projectId: string;
+  userId: string;
+  pass: PassConfig;
+}
+
+export interface CoordinatorEnqueueBody {
+  projectId: string;
+  maxConcurrent: number;
+  users: { userId: string; pass: PassConfig }[];
+}

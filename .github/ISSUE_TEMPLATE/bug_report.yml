@@ -1,0 +1,49 @@
+name: Bug report
+description: Something isn't working as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what happened instead?
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Mail migration
+        - Calendar migration
+        - Contacts migration
+        - Tasks migration
+        - OneDrive migration
+        - Rules & settings
+        - Provisioning / discovery
+        - Connectors / consent flow
+        - Dashboard / UI
+        - Deployment / CI
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: errors
+    attributes:
+      label: Error output
+      description: API error message, item-error rows (Errors tab / CSV), or `wrangler tail` output. Redact tenant names and UPNs as needed.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Commit or version
+      placeholder: e.g. 4bcc575
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I checked the FAQ and the parity & limitations doc
+          required: true
+        - label: This report contains no secrets (tokens, client secrets, passwords)
+          required: true

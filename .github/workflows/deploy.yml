@@ -17,7 +17,7 @@ name: deploy
 
 on:
   push:
-    branches: [main, 'claude/kind-hamilton-xrtlo9']
+    branches: [main]
   workflow_dispatch:
 
 concurrency:

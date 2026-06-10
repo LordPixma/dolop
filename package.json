@@ -2,7 +2,26 @@
   "name": "dolop",
   "version": "0.1.0",
   "private": true,
-  "description": "Cloudflare-native Microsoft 365 tenant-to-tenant migration platform",
+  "description": "Open-source Microsoft 365 tenant-to-tenant migration platform, built entirely on Cloudflare Workers",
+  "license": "MIT",
+  "author": "Samuel Odekunle",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LordPixma/dolop.git"
+  },
+  "homepage": "https://github.com/LordPixma/dolop#readme",
+  "bugs": "https://github.com/LordPixma/dolop/issues",
+  "keywords": [
+    "microsoft-365",
+    "tenant-to-tenant",
+    "migration",
+    "microsoft-graph",
+    "cloudflare-workers",
+    "durable-objects",
+    "mailbox-migration",
+    "onedrive",
+    "merger-acquisition"
+  ],
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",

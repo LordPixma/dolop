@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question / discussion
+    url: https://github.com/LordPixma/dolop/discussions
+    about: Ask questions and share migration experiences
+  - name: Security vulnerability
+    url: https://github.com/LordPixma/dolop/security/advisories/new
+    about: Please report security issues privately, not as public issues

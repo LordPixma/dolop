@@ -1,11 +1,23 @@
 # dolop
 
-**Microsoft 365 tenant-to-tenant migration, built entirely on Cloudflare.**
+**Open-source Microsoft 365 tenant-to-tenant migration, built entirely on Cloudflare.**
 
-Dolop migrates user accounts between M365 tenants during M&A activity — the same job as
-BitTitan MigrationWiz **User Migration Bundle** licences — using nothing but the Cloudflare
-developer platform and the Microsoft Graph API. No servers, no VMs, no agents to babysit:
-the entire migration engine runs in Workers and Durable Objects.
+[![deploy](https://github.com/LordPixma/dolop/actions/workflows/deploy.yml/badge.svg)](https://github.com/LordPixma/dolop/actions/workflows/deploy.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Cloudflare Workers](https://img.shields.io/badge/runs%20on-Cloudflare%20Workers-f38020)](https://workers.cloudflare.com/)
+
+Dolop migrates user accounts between Microsoft 365 tenants — the job commercial tools like
+BitTitan MigrationWiz charge per-user licences for — using nothing but the Cloudflare
+developer platform and the Microsoft Graph API. No servers, no VMs, no agents: the entire
+migration engine runs in Workers and Durable Objects, and you self-host it on your own
+Cloudflare account for pennies.
+
+Built for **M&A scenarios**: assess, provision, pre-stage weeks ahead, keep tenants in sync
+with delta passes, then cut over with minimal user disruption.
+
+> **Status: beta.** Dolop is young and moving fast. Always run an assessment pass first,
+> pilot with test users, and treat the [parity & limitations doc](docs/bittitan-parity.md)
+> as required reading before promising anyone a migration date.
 
 ## What it migrates
 
@@ -21,16 +33,18 @@ the entire migration engine runs in Workers and Durable Objects.
 | **Assessment** | Pre-migration sizing (mailbox item counts, OneDrive usage) and destination readiness checks — writes nothing |
 | **Tenant onboarding** | BitTitan-style **admin consent links**: one multi-tenant app, a Global Admin clicks approve, the connector binds itself — or manual per-tenant app registrations if preferred |
 
-### Migration model (BitTitan-style)
+### The migration model
 
 - **Assessment → Provision → Pre-stage → Delta → Cutover → Final delta**
-- **Pre-stage pass**: bulk-copy mail older than a cutoff date ahead of cutover
-- **Full pass**: everything, idempotent — already-migrated items are skipped via a per-user id map
-- **Delta pass**: only changes since the last pass (Graph delta tokens persisted per folder/drive)
-- **Auto-delta**: cron-scheduled delta sync keeps tenants converged until cutover day
-- **Concurrency control**: per-project concurrent-user limit, queue managed by a coordinator
+- Pass types: **pre-stage** (mail older than a cutoff), **full** (everything, idempotent),
+  **delta** (only changes since the last pass), **assessment** (read-only sizing)
+- **Auto-delta**: cron-scheduled sync keeps tenants converged until cutover day
+- **Live dashboard**: real progress denominators (mailbox folder counts, OneDrive quota),
+  per-workload bars, per-mailbox activity, items/min and data/min throughput
 - **Item-level error reporting**: failures never stop a mailbox; they're logged per item and
   retried on the next delta pass. CSV user/error reports archive to R2.
+- **Concurrency control** per project, automatic Graph throttling backoff, resumable from
+  any interruption (state lives in Durable Object SQLite)
 
 ## Architecture — 100% Cloudflare
 
@@ -57,27 +71,27 @@ the entire migration engine runs in Workers and Durable Objects.
         Cron (auto-delta + watchdog)       users, stats, errors, audit)
 ```
 
-Every user gets a **Durable Object orchestrator** whose SQLite storage holds delta cursors,
-the source→destination id map and a resumable work queue. Work happens in bounded alarm
-"ticks"; Graph throttling (429) pauses exactly as long as `Retry-After` demands, transient
-errors retry with backoff, and the cron watchdog re-arms any stalled orchestrator. The DO
-can be evicted or redeployed mid-mailbox and the next tick picks up where it left off.
+Deep dive: [docs/architecture.md](docs/architecture.md)
 
 ## Quickstart
 
+Prerequisites: a Cloudflare account on the **Workers Paid** plan (Queues requires it; from
+$5/month) and admin access to both M365 tenants.
+
 ```sh
+git clone https://github.com/LordPixma/dolop.git && cd dolop
 npm install
 
-# 1. Provision Cloudflare resources
-wrangler d1 create dolop                  # paste database_id into wrangler.jsonc
-wrangler kv namespace create KV           # paste id into wrangler.jsonc
+# 1. Provision Cloudflare resources (then put the two printed ids in wrangler.jsonc)
+wrangler d1 create dolop
+wrangler kv namespace create KV
 wrangler r2 bucket create dolop-artifacts
 wrangler queues create dolop-migrations
 wrangler queues create dolop-dlq
 
 # 2. Secrets
-openssl rand -base64 32 | wrangler secret put ENCRYPTION_KEY   # encrypts tenant secrets (AES-256-GCM)
-openssl rand -hex 32    | wrangler secret put API_TOKEN        # dashboard/API bearer token
+openssl rand -base64 32 | wrangler secret put ENCRYPTION_KEY   # set ONCE — never change casually
+openssl rand -hex 32    | wrangler secret put API_TOKEN        # automation + password recovery
 
 # 3. Schema + deploy
 npm run db:migrate
@@ -86,33 +100,44 @@ npm run deploy
 
 Open the deployed URL — the first visit walks you through creating the initial
 **administrator account** (username/password; PBKDF2-hashed, HttpOnly session cookies, login
-rate-limiting). Additional operators are managed under **Account → Team**. The `API_TOKEN`
-secret remains valid as a bearer token for automation/CI and as the recovery path if all
-passwords are lost.
+rate-limiting). Then connect your tenants — with **admin consent links** (recommended; see
+Option A in [docs/setup.md](docs/setup.md)) or manual per-tenant app registrations — create
+a project, and follow the [M&A runbook](docs/runbook.md).
 
-Then connect your tenants — either with **admin consent links** (one multi-tenant app,
-recommended; see Option A in [docs/setup.md](docs/setup.md)) or manual per-tenant app
-registrations (Option B) — create a project, and follow the [M&A runbook](docs/runbook.md).
+**CI deploys:** [.github/workflows/deploy.yml](.github/workflows/deploy.yml) auto-deploys on
+push to `main` once you add a `CLOUDFLARE_API_TOKEN` repository secret (it also applies D1
+migrations, ensures queues exist, and syncs optional `DOLOP_*` secrets).
 
-**CI deploys:** `.github/workflows/deploy.yml` auto-deploys on push once you add a
-`CLOUDFLARE_API_TOKEN` repository secret (it also applies D1 migrations, ensures queues
-exist, and syncs optional `DOLOP_*` secrets).
+> Forking? Replace the `database_id` and KV `id` in `wrangler.jsonc` with your own resource
+> ids — they identify the original deployment's resources and won't resolve on your account.
 
-> **Production hardening:** put the Worker behind
-> [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/) so the
-> dashboard and API require your IdP login at the edge in addition to the API token.
+## Documentation
 
-## Docs
+| Doc | What's in it |
+| --- | --- |
+| [Setup guide](docs/setup.md) | Entra app registrations (consent-link & manual modes), permissions, Cloudflare provisioning |
+| [M&A runbook](docs/runbook.md) | Step-by-step cutover playbook, from assessment to aftercare |
+| [Architecture](docs/architecture.md) | Engine internals, tick budgets, idempotency model, security |
+| [FAQ](docs/faq.md) | Costs, speed, data handling, comparisons, troubleshooting |
+| [Parity & limitations](docs/bittitan-parity.md) | Honest feature matrix vs commercial tools — read before cutover |
 
-- [docs/setup.md](docs/setup.md) — Entra app registrations, permissions, Cloudflare provisioning
-- [docs/runbook.md](docs/runbook.md) — step-by-step M&A cutover playbook
-- [docs/architecture.md](docs/architecture.md) — engine internals, budgets, idempotency model
-- [docs/bittitan-parity.md](docs/bittitan-parity.md) — feature parity matrix and honest limitations
+## Security
 
-## Development
+Tenant secrets are AES-256-GCM encrypted at rest with a key that exists only as a Worker
+secret; Graph access is app-only (no user credentials ever collected); operator passwords
+are PBKDF2-hashed; sessions are HttpOnly cookies storing only a hash server-side. Hardening
+guidance (Cloudflare Access, Exchange application access policies) is in
+[SECURITY.md](SECURITY.md) — which is also where to report vulnerabilities.
 
-```sh
-npm run typecheck   # strict TS across src + tests
-npm test            # vitest unit tests (crypto, transforms, utils)
-npm run dev         # wrangler dev (put ENCRYPTION_KEY/API_TOKEN in .dev.vars)
-```
+## Contributing
+
+Issues and PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the dev setup
+(`npm run typecheck`, `npm test`, `npm run dev`) and project layout.
+
+## License & disclaimer
+
+[MIT](LICENSE). Dolop is an independent open-source project: not affiliated with, endorsed
+by, or supported by Microsoft or BitTitan. Microsoft 365 is a trademark of Microsoft
+Corporation; MigrationWiz is a trademark of BitTitan, Inc. — referenced only for feature
+comparison. Migrations move real people's mailboxes: test thoroughly, read the limitations,
+and use at your own risk.

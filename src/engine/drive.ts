@@ -90,6 +90,11 @@ export class DriveEngine implements WorkloadEngine {
     }
     store.setState(W, 'srcDriveId', src.id);
     store.setState(W, 'dstDriveId', dst.id);
+    // Quota usage gives byte-level progress a real denominator (full passes
+    // only — delta passes copy just the changes).
+    if (ctx.pass.passType !== 'delta' && src.quota?.used) {
+      report.expectedBytes(W, src.quota.used);
+    }
     store.setPhase(W, 'walk');
     return 'continue';
   }

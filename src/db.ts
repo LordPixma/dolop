@@ -7,6 +7,7 @@ import type {
   PassConfig,
   Project,
   ProjectSettings,
+  UserActivity,
   UserStats,
   UserStatus,
 } from './types';
@@ -273,6 +274,7 @@ interface UserRow {
   pass_type: string | null;
   pass_config: string | null;
   stats: string;
+  activity: string | null;
   error: string | null;
   heartbeat_at: string | null;
   started_at: string | null;
@@ -294,6 +296,7 @@ function rowToUser(r: UserRow): MigrationUser {
     passType: (r.pass_type ?? undefined) as MigrationUser['passType'],
     passConfig: parseJson<PassConfig | undefined>(r.pass_config, undefined),
     stats: parseJson<UserStats>(r.stats, {}),
+    activity: parseJson<UserActivity | undefined>(r.activity, undefined),
     error: r.error ?? undefined,
     heartbeatAt: r.heartbeat_at ?? undefined,
     startedAt: r.started_at ?? undefined,
@@ -428,6 +431,7 @@ export async function updateUserStatus(
     destUpn?: string;
     displayName?: string;
     stats?: UserStats;
+    activity?: UserActivity | null;
   }
 ): Promise<void> {
   const sets: string[] = ['updated_at = ?'];
@@ -476,6 +480,10 @@ export async function updateUserStatus(
     sets.push('stats = ?');
     binds.push(JSON.stringify(patch.stats));
   }
+  if (patch.activity !== undefined) {
+    sets.push('activity = ?');
+    binds.push(patch.activity ? JSON.stringify(patch.activity) : null);
+  }
   binds.push(userId);
   await db.prepare(`UPDATE migration_users SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
 }
@@ -483,11 +491,12 @@ export async function updateUserStatus(
 export async function flushUserProgress(
   db: D1Database,
   userId: string,
-  stats: UserStats
+  stats: UserStats,
+  activity?: UserActivity | null
 ): Promise<void> {
   await db
-    .prepare('UPDATE migration_users SET stats = ?, heartbeat_at = ?, updated_at = ? WHERE id = ?')
-    .bind(JSON.stringify(stats), nowIso(), nowIso(), userId)
+    .prepare('UPDATE migration_users SET stats = ?, activity = ?, heartbeat_at = ?, updated_at = ? WHERE id = ?')
+    .bind(JSON.stringify(stats), activity ? JSON.stringify(activity) : null, nowIso(), nowIso(), userId)
     .run();
 }
 

@@ -96,6 +96,16 @@ class StatsReporter implements Reporter {
     this.bucket(workload).bytes += n;
   }
 
+  expected(workload: string, n: number): void {
+    const b = this.bucket(workload);
+    b.expected = (b.expected ?? 0) + n;
+  }
+
+  expectedBytes(workload: string, n: number): void {
+    const b = this.bucket(workload);
+    b.expectedBytes = (b.expectedBytes ?? 0) + n;
+  }
+
   itemError(workload: string, err: ItemErrorInput): void {
     this.errors.push(err);
     this.errorWorkloads.push(workload);
@@ -424,7 +434,11 @@ export class MigrationOrchestrator extends DurableObject<Env> {
 
   private async flush(job: JobState, reporter: StatsReporter): Promise<void> {
     this.store.setJson('sys:stats', reporter.stats);
-    await flushUserProgress(this.env.DB, job.userId, reporter.stats);
+    const workload = job.workloads[job.workloadIndex];
+    const activity = workload
+      ? { workload, phase: this.store.getPhase(workload) ?? 'starting', at: nowIso() }
+      : null;
+    await flushUserProgress(this.env.DB, job.userId, reporter.stats, activity);
     if (reporter.errors.length > 0) {
       await insertItemErrors(
         this.env.DB,
@@ -460,6 +474,7 @@ export class MigrationOrchestrator extends DurableObject<Env> {
       status,
       error: error ?? null,
       completedAt: nowIso(),
+      activity: null,
     });
     await logEvent(this.env.DB, {
       projectId: job.projectId,

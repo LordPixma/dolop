@@ -47,6 +47,9 @@ export interface ItemErrorInput {
 export interface Reporter {
   stat(workload: string, field: 'discovered' | 'migrated' | 'skipped' | 'failed', delta?: number): void;
   bytes(workload: string, n: number): void;
+  /** Register items known upfront — the denominator real progress bars need. */
+  expected(workload: string, n: number): void;
+  expectedBytes(workload: string, n: number): void;
   itemError(workload: string, err: ItemErrorInput): void;
 }
 

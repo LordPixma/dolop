@@ -5,11 +5,13 @@ import {
   createProject,
   deleteProject,
   getConnector,
+  listAllProjectUsers,
   listProjects,
   projectUserSummary,
   updateProject,
 } from '../db';
-import type { Env, ProjectSettings } from '../types';
+import type { Env, ProjectSettings, WorkloadStats } from '../types';
+import { nowIso } from '../util';
 import { ApiError, loadProject } from './helpers';
 
 export const projectsApi = new Hono<{ Bindings: Env }>();
@@ -60,6 +62,65 @@ projectsApi.get('/:projectId', async (c) => {
     userSummary: summary,
     sourceConnector: safe(source),
     destConnector: safe(dest),
+  });
+});
+
+// Live aggregate progress across the whole project, for the dashboard.
+projectsApi.get('/:projectId/progress', async (c) => {
+  const project = await loadProject(c.env, c.req.param('projectId'));
+  const users = await listAllProjectUsers(c.env.DB, project.id);
+
+  const zero = (): Required<WorkloadStats> => ({
+    discovered: 0,
+    migrated: 0,
+    skipped: 0,
+    failed: 0,
+    bytes: 0,
+    expected: 0,
+    expectedBytes: 0,
+  });
+  const totals = zero();
+  const byWorkload: Record<string, Required<WorkloadStats>> = {};
+  const statusCounts: Record<string, number> = {};
+  const active: unknown[] = [];
+
+  for (const u of users) {
+    statusCounts[u.status] = (statusCounts[u.status] ?? 0) + 1;
+    for (const [key, s] of Object.entries(u.stats)) {
+      if (key.startsWith('assessment')) continue;
+      const bucket = (byWorkload[key] ??= zero());
+      for (const target of [bucket, totals]) {
+        target.discovered += s.discovered ?? 0;
+        target.migrated += s.migrated ?? 0;
+        target.skipped += s.skipped ?? 0;
+        target.failed += s.failed ?? 0;
+        target.bytes += s.bytes ?? 0;
+        target.expected += s.expected ?? 0;
+        target.expectedBytes += s.expectedBytes ?? 0;
+      }
+    }
+    if (u.status === 'running') {
+      active.push({
+        id: u.id,
+        sourceUpn: u.sourceUpn,
+        displayName: u.displayName,
+        passType: u.passType,
+        passConfig: u.passConfig,
+        activity: u.activity,
+        stats: u.stats,
+        startedAt: u.startedAt,
+        heartbeatAt: u.heartbeatAt,
+      });
+    }
+  }
+
+  return c.json({
+    totals,
+    byWorkload,
+    statusCounts,
+    active: active.slice(0, 50),
+    userCount: users.length,
+    generatedAt: nowIso(),
   });
 });
 

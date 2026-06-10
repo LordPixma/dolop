@@ -82,28 +82,81 @@ function fmtDate(iso) {
 function pill(status) { return `<span class="pill ${esc(status)}">${esc(String(status).replace(/_/g, ' '))}</span>`; }
 
 function sumUserStats(stats) {
-  const t = { discovered: 0, migrated: 0, skipped: 0, failed: 0, bytes: 0 };
+  const t = { discovered: 0, migrated: 0, skipped: 0, failed: 0, bytes: 0, expected: 0, expectedBytes: 0 };
   for (const [k, s] of Object.entries(stats || {})) {
     if (k.startsWith('assessment')) continue;
     t.discovered += s.discovered || 0; t.migrated += s.migrated || 0;
     t.skipped += s.skipped || 0; t.failed += s.failed || 0; t.bytes += s.bytes || 0;
+    t.expected += s.expected || 0; t.expectedBytes += s.expectedBytes || 0;
   }
   return t;
-}
-
-function progressBar(user) {
-  const t = sumUserStats(user.stats);
-  const done = t.migrated + t.skipped + t.failed;
-  const pct = t.discovered > 0 ? Math.min(100, Math.round((done / t.discovered) * 100)) : (user.status === 'completed' ? 100 : 0);
-  const cls = user.status === 'completed' ? 'done' : '';
-  return `<div class="progress ${cls}" title="${done}/${t.discovered}"><div style="width:${pct}%"></div></div>`;
 }
 
 const WORKLOADS = ['mail', 'calendar', 'contacts', 'tasks', 'drive', 'rules'];
 const WORKLOAD_LABELS = {
   mail: 'Mail', calendar: 'Calendar', contacts: 'Contacts',
   tasks: 'Tasks (To Do)', drive: 'OneDrive', rules: 'Rules & settings',
+  assessment: 'Assessment',
 };
+
+const PHASE_LABELS = {
+  init: 'starting', starting: 'starting',
+  folders: 'mapping folders', items: 'copying items',
+  calendars: 'mapping calendars', lists: 'mapping lists',
+  walk: 'copying files',
+  categories: 'copying categories', rules: 'copying inbox rules', settings: 'applying mailbox settings',
+  mail: 'counting mailbox', drive: 'checking OneDrive', dest: 'checking destination',
+};
+
+function activityLabel(activity) {
+  if (!activity) return '';
+  const wl = WORKLOAD_LABELS[activity.workload] || activity.workload;
+  return `${wl} — ${PHASE_LABELS[activity.phase] || activity.phase}`;
+}
+
+/**
+ * Fraction complete for one workload. Uses the upfront totals captured by the
+ * engines (mailbox folder counts, OneDrive quota bytes) as the denominator;
+ * workloads without a known total are capped at 90% until they finish, so the
+ * bar can't sit at 100% while work remains.
+ */
+function workloadFraction(s) {
+  if (!s) return 0;
+  const done = (s.migrated || 0) + (s.skipped || 0) + (s.failed || 0);
+  if (s.expected > 0) return Math.min(1, done / s.expected);
+  if (s.expectedBytes > 0) return Math.min(1, (s.bytes || 0) / s.expectedBytes);
+  if (s.discovered > 0) return Math.min(0.9, done / s.discovered);
+  return 0;
+}
+
+/** Staged overall progress: finished workloads count fully, the active one partially. */
+function userProgress(user) {
+  if (user.status === 'completed' || user.status === 'completed_with_errors') return 1;
+  if (user.status === 'pending' || user.status === 'queued' || user.status === 'stopped') return 0;
+  if (user.passType === 'assessment') return user.status === 'running' ? 0.5 : 0;
+  const selected = user.passConfig?.workloads?.length
+    ? WORKLOADS.filter((w) => user.passConfig.workloads.includes(w))
+    : WORKLOADS.filter((w) => user.stats && user.stats[w]);
+  if (!selected.length) return 0;
+  const activeIdx = user.activity ? selected.indexOf(user.activity.workload) : -1;
+  let sum = 0;
+  selected.forEach((w, i) => {
+    if (activeIdx >= 0 && i < activeIdx) sum += 1;
+    else if (activeIdx >= 0 && i > activeIdx) sum += 0;
+    else sum += workloadFraction(user.stats ? user.stats[w] : null);
+  });
+  return sum / selected.length;
+}
+
+function bar(fraction, done) {
+  const pct = Math.round(Math.max(0, Math.min(1, fraction)) * 100);
+  return `<div class="progress ${done ? 'done' : ''}" title="${pct}%"><div style="width:${pct}%"></div></div>`;
+}
+
+function progressBar(user) {
+  const isDone = user.status === 'completed' || user.status === 'completed_with_errors';
+  return bar(userProgress(user), isDone);
+}
 
 // ---------------------------------------------------------------------------
 // Sign-in (username/password sessions; API token as fallback/recovery)
@@ -528,14 +581,16 @@ async function tabUsers(c, project) {
   const { users, total } = await api('GET', `/api/projects/${project.id}/users?limit=100&offset=${offset}`);
   const rows = users.map((u) => {
     const t = sumUserStats(u.stats);
+    const denom = t.expected > t.discovered ? t.expected : t.discovered;
+    const act = u.status === 'running' ? activityLabel(u.activity) : '';
     return `
       <tr class="clickable" data-user="${u.id}">
         <td class="checkbox-col" data-stop><input type="checkbox" data-sel="${u.id}" /></td>
         <td><strong>${esc(u.sourceUpn)}</strong><div class="muted" style="font-size:.76rem">${esc(u.displayName || '')}</div></td>
         <td class="mono">${esc(u.destUpn)}</td>
         <td>${pill(u.status)}</td>
-        <td>${progressBar(u)}</td>
-        <td class="right mono">${t.migrated}/${t.discovered}${t.failed ? ` <span style="color:var(--red)">(${t.failed}✗)</span>` : ''}</td>
+        <td>${progressBar(u)}${act ? `<div class="muted" style="font-size:.72rem;margin-top:.2rem">${esc(act)}</div>` : ''}</td>
+        <td class="right mono">${t.migrated}/${denom}${t.failed ? ` <span style="color:var(--red)">(${t.failed}✗)</span>` : ''}</td>
         <td class="right mono">${fmtBytes(t.bytes)}</td>
       </tr>`;
   }).join('');
@@ -595,11 +650,31 @@ async function tabUsers(c, project) {
 async function userDetailModal(project, userId) {
   const { user, recentErrors } = await api('GET', `/api/projects/${project.id}/users/${userId}`);
   const canEdit = user.status !== 'running' && user.status !== 'queued';
-  const wlRows = Object.entries(user.stats || {}).map(([w, st]) => `
-    <tr><td>${esc(WORKLOAD_LABELS[w] || w)}</td>
-    <td class="right mono">${st.discovered || 0}</td><td class="right mono">${st.migrated || 0}</td>
+  const orderedKeys = [
+    ...WORKLOADS.filter((w) => user.stats && user.stats[w]),
+    ...Object.keys(user.stats || {}).filter((k) => !WORKLOADS.includes(k)),
+  ];
+  const activeWl = user.status === 'running' ? user.activity?.workload : null;
+  const selected = user.passConfig?.workloads || [];
+  const activeIdx = activeWl ? selected.indexOf(activeWl) : -1;
+  const wlRows = orderedKeys.map((w) => {
+    const st = user.stats[w];
+    const idx = selected.indexOf(w);
+    const finished =
+      user.status === 'completed' || user.status === 'completed_with_errors' ||
+      (activeIdx >= 0 && idx >= 0 && idx < activeIdx);
+    const frac = finished ? 1 : workloadFraction(st);
+    const denom = (st.expected || 0) > (st.discovered || 0) ? st.expected : st.discovered || 0;
+    return `
+    <tr><td>${esc(WORKLOAD_LABELS[w] || w)}${w === activeWl ? ' <span class="pill running">active</span>' : ''}</td>
+    <td style="width:120px">${bar(frac, finished)}</td>
+    <td class="right mono">${st.migrated || 0}/${denom}</td>
     <td class="right mono">${st.skipped || 0}</td><td class="right mono" style="color:${st.failed ? 'var(--red)' : 'inherit'}">${st.failed || 0}</td>
-    <td class="right mono">${fmtBytes(st.bytes || 0)}</td></tr>`).join('');
+    <td class="right mono">${fmtBytes(st.bytes || 0)}${st.expectedBytes ? `<span class="muted"> / ${fmtBytes(st.expectedBytes)}</span>` : ''}</td></tr>`;
+  }).join('');
+  const elapsed = user.startedAt && user.status === 'running'
+    ? `${Math.max(1, Math.round((Date.now() - Date.parse(user.startedAt)) / 60000))} min`
+    : null;
   const errRows = recentErrors.map((e) => `
     <tr><td>${esc(e.workload)}</td><td>${esc(e.itemType || '')}</td>
     <td>${esc(e.itemName || e.itemId || '')}</td><td class="mono" style="font-size:.76rem">${esc(e.code || '')}: ${esc((e.message || '').slice(0, 160))}</td></tr>`).join('');
@@ -608,13 +683,15 @@ async function userDetailModal(project, userId) {
     <dl class="kv">
       <dt>Destination</dt><dd class="mono" id="ud-dest-row">${esc(user.destUpn)}${canEdit ? ' <button class="small" id="ud-edit-dest">Edit</button>' : ''}</dd>
       <dt>Last pass</dt><dd>${esc(user.passType || '—')}</dd>
-      <dt>Started</dt><dd>${fmtDate(user.startedAt)}</dd>
+      <dt>Started</dt><dd>${fmtDate(user.startedAt)}${elapsed ? ` <span class="muted">(${elapsed} elapsed)</span>` : ''}</dd>
       <dt>Completed</dt><dd>${fmtDate(user.completedAt)}</dd>
       <dt>Heartbeat</dt><dd>${fmtDate(user.heartbeatAt)}</dd>
+      ${user.status === 'running' && user.activity ? `<dt>Activity</dt><dd>${esc(activityLabel(user.activity))}</dd>` : ''}
       ${user.error ? `<dt>Error</dt><dd style="color:var(--red)">${esc(user.error)}</dd>` : ''}
     </dl>
+    <div style="margin:.8rem 0">${progressBar(user)}</div>
     <h2>Workloads</h2>
-    ${wlRows ? `<table class="wl-table"><thead><tr><th>Workload</th><th class="right">Found</th><th class="right">Migrated</th><th class="right">Skipped</th><th class="right">Failed</th><th class="right">Data</th></tr></thead><tbody>${wlRows}</tbody></table>` : '<div class="muted">No stats yet.</div>'}
+    ${wlRows ? `<table class="wl-table"><thead><tr><th>Workload</th><th>Progress</th><th class="right">Migrated</th><th class="right">Skipped</th><th class="right">Failed</th><th class="right">Data</th></tr></thead><tbody>${wlRows}</tbody></table>` : '<div class="muted">No stats yet.</div>'}
     ${errRows ? `<h2>Recent item errors</h2><table class="wl-table"><tbody>${errRows}</tbody></table>` : ''}
     <div class="actions">
       ${user.status === 'running' || user.status === 'queued'
@@ -777,27 +854,81 @@ async function provisionModal(project, userIds) {
 
 // -- Migrate tab --------------------------------------------------------------
 
+// Previous progress snapshots per project, for client-side throughput rates.
+const rateState = new Map();
+
+function throughput(projectId, totals) {
+  const now = Date.now();
+  const prev = rateState.get(projectId);
+  rateState.set(projectId, { ts: now, migrated: totals.migrated, bytes: totals.bytes });
+  if (!prev || now - prev.ts < 2000 || now - prev.ts > 120000) return null;
+  const mins = (now - prev.ts) / 60000;
+  return {
+    itemsPerMin: Math.max(0, Math.round((totals.migrated - prev.migrated) / mins)),
+    bytesPerMin: Math.max(0, (totals.bytes - prev.bytes) / mins),
+  };
+}
+
 async function tabMigrate(c, project) {
   let queue = { queued: 0, running: [], maxConcurrent: project.settings.maxConcurrentUsers };
+  let progress = { totals: {}, byWorkload: {}, statusCounts: {}, active: [] };
   try { queue = await api('GET', `/api/projects/${project.id}/queue`); } catch { /* coordinator not yet created */ }
+  try { progress = await api('GET', `/api/projects/${project.id}/progress`); } catch { /* no data yet */ }
+  const t = { discovered: 0, migrated: 0, skipped: 0, failed: 0, bytes: 0, expected: 0, expectedBytes: 0, ...progress.totals };
+  const denom = Math.max(t.expected, t.discovered);
+  const rate = throughput(project.id, t);
+
+  const wlRows = WORKLOADS.filter((w) => progress.byWorkload[w]).map((w) => {
+    const s = progress.byWorkload[w];
+    const wDenom = Math.max(s.expected || 0, s.discovered || 0);
+    const done = (s.migrated || 0) + (s.skipped || 0) + (s.failed || 0);
+    const frac = s.expectedBytes > 0 && w === 'drive'
+      ? Math.min(1, (s.bytes || 0) / s.expectedBytes)
+      : wDenom > 0 ? Math.min(1, done / wDenom) : 0;
+    return `
+      <tr><td>${WORKLOAD_LABELS[w]}</td>
+      <td style="width:160px">${bar(frac, false)}</td>
+      <td class="right mono">${s.migrated || 0}/${wDenom}</td>
+      <td class="right mono">${s.skipped || 0}</td>
+      <td class="right mono" style="color:${s.failed ? 'var(--red)' : 'inherit'}">${s.failed || 0}</td>
+      <td class="right mono">${fmtBytes(s.bytes || 0)}${s.expectedBytes ? `<span class="muted"> / ${fmtBytes(s.expectedBytes)}</span>` : ''}</td></tr>`;
+  }).join('');
+
+  const activeRows = (progress.active || []).map((u) => `
+    <tr class="clickable" data-user="${u.id}">
+      <td><strong>${esc(u.sourceUpn)}</strong></td>
+      <td style="width:160px">${bar(userProgress({ ...u, status: 'running' }), false)}</td>
+      <td class="muted" style="font-size:.78rem">${esc(activityLabel(u.activity)) || 'starting'}</td>
+      <td class="muted right" style="font-size:.78rem;white-space:nowrap">${u.startedAt ? `${Math.max(1, Math.round((Date.now() - Date.parse(u.startedAt)) / 60000))} min` : ''}</td>
+    </tr>`).join('');
+
   c.innerHTML = `
-    <div class="grid" style="grid-template-columns: 1fr 1fr">
-      <div class="card">
-        <h3>Run a migration pass</h3>
-        <p class="sub">Recommended sequence for cutover: <strong>assessment → provision → pre-stage → delta passes → MX/domain cutover → final delta</strong>.</p>
-        <div class="btnrow" style="margin-top:.8rem">
+    <div class="card">
+      <div class="page-head" style="margin-bottom:.4rem">
+        <h3 style="margin:0">Live progress</h3>
+        <div class="btnrow">
           <button class="primary" id="mg-start">Start a pass…</button>
           <button class="danger" id="mg-stop">Stop all</button>
         </div>
       </div>
-      <div class="card">
-        <h3>Live queue</h3>
-        <div class="statrow">
-          <div class="stat"><div class="n">${queue.queued || 0}</div><div class="l">waiting</div></div>
-          <div class="stat"><div class="n">${(queue.running || []).length}</div><div class="l">running</div></div>
-          <div class="stat"><div class="n">${queue.maxConcurrent || project.settings.maxConcurrentUsers}</div><div class="l">concurrency</div></div>
-        </div>
-        <div class="muted" style="font-size:.8rem;margin-top:.5rem">Concurrency is set in project Settings. Throttling by Microsoft Graph is handled automatically with retry-after backoff.</div>
+      <div class="statrow">
+        <div class="stat"><div class="n">${t.migrated.toLocaleString()}<span class="muted" style="font-size:.85rem"> / ${denom.toLocaleString()}</span></div><div class="l">items migrated</div></div>
+        <div class="stat"><div class="n">${fmtBytes(t.bytes)}${t.expectedBytes ? `<span class="muted" style="font-size:.85rem"> / ${fmtBytes(t.expectedBytes)}</span>` : ''}</div><div class="l">data moved</div></div>
+        <div class="stat"><div class="n" style="color:${t.failed ? 'var(--red)' : 'inherit'}">${t.failed.toLocaleString()}</div><div class="l">item failures</div></div>
+        <div class="stat"><div class="n">${(queue.running || []).length}<span class="muted" style="font-size:.85rem"> +${queue.queued || 0} waiting</span></div><div class="l">running (max ${queue.maxConcurrent || project.settings.maxConcurrentUsers})</div></div>
+        <div class="stat"><div class="n">${rate ? rate.itemsPerMin.toLocaleString() : '—'}</div><div class="l">items / min</div></div>
+        <div class="stat"><div class="n">${rate ? fmtBytes(rate.bytesPerMin) : '—'}</div><div class="l">data / min</div></div>
+      </div>
+      <div style="margin-top:.8rem">${bar(denom > 0 ? Math.min(1, (t.migrated + t.skipped + t.failed) / denom) : 0, false)}</div>
+      ${wlRows ? `
+      <h2 style="margin-top:1.2rem">By workload</h2>
+      <table class="wl-table"><thead><tr><th>Workload</th><th>Progress</th><th class="right">Migrated</th><th class="right">Skipped</th><th class="right">Failed</th><th class="right">Data</th></tr></thead><tbody>${wlRows}</tbody></table>` : ''}
+      ${activeRows ? `
+      <h2 style="margin-top:1.2rem">Active mailboxes</h2>
+      <table class="wl-table"><tbody>${activeRows}</tbody></table>` : ''}
+      <div class="muted" style="font-size:.8rem;margin-top:.8rem">
+        Recommended cutover sequence: <strong>assessment → provision → pre-stage → delta passes → MX/domain cutover → final delta</strong>.
+        Totals come from mailbox folder counts and OneDrive quota captured at pass start; Graph throttling is handled automatically.
       </div>
     </div>
     <div class="card">
@@ -808,6 +939,10 @@ async function tabMigrate(c, project) {
       </div>
       <div class="muted" style="font-size:.8rem;margin-top:.5rem">Reports are also archived to the R2 bucket.</div>
     </div>`;
+
+  c.querySelectorAll('tr[data-user]').forEach((tr) => tr.addEventListener('click', () => {
+    userDetailModal(project, tr.dataset.user);
+  }));
   c.querySelector('#mg-start').addEventListener('click', () => startPassModal(project, null));
   c.querySelector('#mg-stop').addEventListener('click', async () => {
     if (!confirm('Stop all queued and running migrations in this project?')) return;

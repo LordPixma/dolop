@@ -149,6 +149,11 @@ export class MailEngine implements WorkloadEngine {
             path: childPath,
             asDraft: wellKnownName === 'drafts',
           } satisfies ScanWork);
+          // Folder item counts give progress bars a real denominator. Delta
+          // passes only see new items, so the full count would mislead there.
+          if (ctx.pass.passType !== 'delta') {
+            ctx.report.expected(W, child.totalItemCount);
+          }
         }
       }
       store.popWork(work.id);

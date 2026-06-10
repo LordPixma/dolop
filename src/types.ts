@@ -86,6 +86,10 @@ export interface WorkloadStats {
   skipped: number;
   failed: number;
   bytes: number;
+  /** Total items known upfront (e.g. mailbox folder item counts) — the real progress denominator. */
+  expected?: number;
+  /** Total bytes known upfront (e.g. OneDrive quota used). */
+  expectedBytes?: number;
 }
 
 export function emptyWorkloadStats(): WorkloadStats {
@@ -94,6 +98,13 @@ export function emptyWorkloadStats(): WorkloadStats {
 
 /** Per-user stats keyed by workload (plus 'assessment'). */
 export type UserStats = Record<string, WorkloadStats>;
+
+/** What a running migration is doing right now. */
+export interface UserActivity {
+  workload: string;
+  phase: string;
+  at: string;
+}
 
 export interface Connector {
   id: string;
@@ -138,6 +149,7 @@ export interface MigrationUser {
   passType?: PassType;
   passConfig?: PassConfig;
   stats: UserStats;
+  activity?: UserActivity;
   error?: string;
   heartbeatAt?: string;
   startedAt?: string;

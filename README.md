@@ -1,4 +1,4 @@
-# dolop
+# Dolop
 
 **Open-source Microsoft 365 tenant-to-tenant migration, built entirely on Cloudflare.**
 

@@ -1,0 +1,65 @@
+# Auto-deploys dolop to Cloudflare on push.
+#
+# Required repository secret:
+#   CLOUDFLARE_API_TOKEN  — "Edit Cloudflare Workers" template + Queues:Edit + D1:Edit
+# Optional repository secrets (synced to Worker secrets when present):
+#   CLOUDFLARE_ACCOUNT_ID — only needed if the token can see multiple accounts
+#   DOLOP_API_TOKEN       — dashboard/API bearer token
+#   DOLOP_ENCRYPTION_KEY  — base64 32-byte AES key (openssl rand -base64 32)
+#   DOLOP_MT_CLIENT_ID / DOLOP_MT_CLIENT_SECRET — multi-tenant app for admin-consent connectors
+
+name: deploy
+
+on:
+  push:
+    branches: [main, 'claude/kind-hamilton-xrtlo9']
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm test
+
+      - name: Ensure queues exist
+        run: |
+          npx wrangler queues create dolop-migrations 2>/dev/null || echo "queue dolop-migrations already exists"
+          npx wrangler queues create dolop-dlq 2>/dev/null || echo "queue dolop-dlq already exists"
+
+      - name: Apply D1 migrations
+        run: npx wrangler d1 migrations apply dolop --remote
+
+      - name: Sync Worker secrets (only those provided)
+        env:
+          DOLOP_API_TOKEN: ${{ secrets.DOLOP_API_TOKEN }}
+          DOLOP_ENCRYPTION_KEY: ${{ secrets.DOLOP_ENCRYPTION_KEY }}
+          DOLOP_MT_CLIENT_ID: ${{ secrets.DOLOP_MT_CLIENT_ID }}
+          DOLOP_MT_CLIENT_SECRET: ${{ secrets.DOLOP_MT_CLIENT_SECRET }}
+        run: |
+          set -e
+          put() { if [ -n "$2" ]; then printf '%s' "$2" | npx wrangler secret put "$1"; else echo "skip $1 (not set)"; fi; }
+          put API_TOKEN "$DOLOP_API_TOKEN"
+          put ENCRYPTION_KEY "$DOLOP_ENCRYPTION_KEY"
+          put MT_CLIENT_ID "$DOLOP_MT_CLIENT_ID"
+          put MT_CLIENT_SECRET "$DOLOP_MT_CLIENT_SECRET"
+
+      - name: Deploy
+        run: npx wrangler deploy

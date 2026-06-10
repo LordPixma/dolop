@@ -12,6 +12,13 @@ export interface Env {
   ENCRYPTION_KEY: string;
   /** bearer token protecting the API (wrangler secret) */
   API_TOKEN: string;
+  /**
+   * Optional: Dolop's own multi-tenant Entra app (admin-consent connector
+   * mode). When set, connectors can be created by sending a tenant admin a
+   * consent link instead of registering an app per tenant.
+   */
+  MT_CLIENT_ID?: string;
+  MT_CLIENT_SECRET?: string;
 }
 
 export type Workload = 'mail' | 'calendar' | 'contacts' | 'tasks' | 'drive' | 'rules';
@@ -95,7 +102,13 @@ export interface Connector {
   clientId: string;
   /** decrypted only when needed; never returned by the API */
   clientSecret?: string;
-  verifyStatus: 'unverified' | 'ok' | 'failed';
+  /**
+   * 'secret': per-tenant app registration with its own client secret.
+   * 'consent': tenant granted admin consent to this deployment's multi-tenant
+   * app (MT_CLIENT_ID/MT_CLIENT_SECRET); no per-connector secret stored.
+   */
+  authMode: 'secret' | 'consent';
+  verifyStatus: 'unverified' | 'ok' | 'failed' | 'pending_consent';
   verifyDetail?: string;
   lastVerifiedAt?: string;
   createdAt: string;

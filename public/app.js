@@ -194,13 +194,14 @@ async function viewConnectors() {
   const { connectors } = await api('GET', '/api/connectors');
   const rows = connectors.map((c) => `
     <tr>
-      <td><strong>${esc(c.name)}</strong></td>
-      <td class="mono">${esc(c.tenantId)}</td>
+      <td><strong>${esc(c.name)}</strong><div style="margin-top:.15rem"><span class="pill mode">${c.authMode === 'consent' ? 'admin consent' : 'app credentials'}</span></div></td>
+      <td class="mono">${esc(c.tenantId || '—')}</td>
       <td class="mono">${esc(c.clientId)}</td>
       <td>${pill(c.verifyStatus)}<div class="muted" style="font-size:.76rem">${esc(c.verifyDetail || '')}</div></td>
       <td class="right">
+        ${c.authMode === 'consent' ? `<button class="small" data-relink="${c.id}">Consent link</button>` : ''}
         <button class="small" data-verify="${c.id}">Verify</button>
-        <button class="small" data-rotate="${c.id}">Rotate secret</button>
+        ${c.authMode === 'secret' ? `<button class="small" data-rotate="${c.id}">Rotate secret</button>` : ''}
         <button class="small danger" data-del="${c.id}">Delete</button>
       </td>
     </tr>`).join('');
@@ -214,6 +215,12 @@ async function viewConnectors() {
       ${connectors.length ? `<table><thead><tr><th>Name</th><th>Tenant ID</th><th>Client ID</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">No connectors yet.</div>'}
     </div>`;
   document.getElementById('new-connector').addEventListener('click', newConnectorModal);
+  $app.querySelectorAll('[data-relink]').forEach((b) => b.addEventListener('click', async () => {
+    try {
+      const r = await api('POST', `/api/connectors/${b.dataset.relink}/consent-link`);
+      showConsentLink(r.consentUrl, r.redirectUri);
+    } catch (e) { toast(e.message, 'error'); }
+  }));
   $app.querySelectorAll('[data-verify]').forEach((b) => b.addEventListener('click', async () => {
     b.disabled = true;
     try {
@@ -242,18 +249,61 @@ async function viewConnectors() {
   }));
 }
 
+function showConsentLink(consentUrl, redirectUri) {
+  const m = modal(`
+    <h2>Admin consent link</h2>
+    <p class="sub">Send this link to a <strong>Global Administrator of the target tenant</strong>. When they approve, the tenant connects automatically — no app registration or secret needed on their side. The link is valid for 7 days.</p>
+    <div class="linkbox"><input id="cl-url" class="mono" readonly value="${esc(consentUrl)}" /><button class="small" id="cl-copy">Copy</button></div>
+    <p class="sub" style="margin-top:.8rem">Ensure <code class="mono">${esc(redirectUri)}</code> is registered as a redirect URI on your multi-tenant app.</p>
+    <div class="actions">
+      <a class="btn" href="${esc(consentUrl)}" target="_blank" rel="noopener">Open link</a>
+      <button class="primary" id="cl-done">Done</button>
+    </div>`, { wide: true });
+  m.querySelector('#cl-copy').addEventListener('click', () => {
+    navigator.clipboard.writeText(consentUrl).then(() => toast('Link copied', 'ok'));
+  });
+  m.querySelector('#cl-done').addEventListener('click', () => { closeModal(); viewConnectors(); });
+}
+
 function newConnectorModal() {
   const m = modal(`
     <h2>Add tenant connector</h2>
-    <p class="sub">Register an app in the tenant's Entra ID with the Graph <em>application</em> permissions listed in <code>docs/setup.md</code>, grant admin consent, then paste its details here. The secret is encrypted with AES-256-GCM before storage.</p>
-    <label>Name</label><input id="c-name" placeholder="Contoso (source)" />
-    <label>Directory (tenant) ID</label><input id="c-tenant" placeholder="00000000-0000-0000-0000-000000000000" />
-    <label>Application (client) ID</label><input id="c-client" />
-    <label>Client secret</label><input id="c-secret" type="password" />
+    <div class="mode-switch">
+      <button id="mode-consent" class="active">Admin consent link (recommended)</button>
+      <button id="mode-secret">Manual app credentials</button>
+    </div>
+    <div id="pane-consent">
+      <p class="sub">Uses this deployment's multi-tenant app (<code>MT_CLIENT_ID</code>/<code>MT_CLIENT_SECRET</code> secrets). Generate a link, send it to the tenant's Global Admin, and the connector binds itself when they approve — like BitTitan/ShareGate onboarding.</p>
+      <label>Name</label><input id="cc-name" placeholder="Contoso (source)" />
+    </div>
+    <div id="pane-secret" style="display:none">
+      <p class="sub">Register an app in the tenant's Entra ID with the Graph <em>application</em> permissions listed in <code>docs/setup.md</code>, grant admin consent, then paste its details. The secret is encrypted with AES-256-GCM before storage.</p>
+      <label>Name</label><input id="c-name" placeholder="Contoso (source)" />
+      <label>Directory (tenant) ID</label><input id="c-tenant" placeholder="00000000-0000-0000-0000-000000000000" />
+      <label>Application (client) ID</label><input id="c-client" />
+      <label>Client secret</label><input id="c-secret" type="password" />
+    </div>
     <div class="actions"><button id="m-cancel">Cancel</button><button class="primary" id="m-save">Add</button></div>`);
+  let mode = 'consent';
+  const setMode = (next) => {
+    mode = next;
+    m.querySelector('#mode-consent').classList.toggle('active', next === 'consent');
+    m.querySelector('#mode-secret').classList.toggle('active', next === 'secret');
+    m.querySelector('#pane-consent').style.display = next === 'consent' ? 'block' : 'none';
+    m.querySelector('#pane-secret').style.display = next === 'secret' ? 'block' : 'none';
+  };
+  m.querySelector('#mode-consent').addEventListener('click', () => setMode('consent'));
+  m.querySelector('#mode-secret').addEventListener('click', () => setMode('secret'));
   m.querySelector('#m-cancel').addEventListener('click', closeModal);
   m.querySelector('#m-save').addEventListener('click', async () => {
     try {
+      if (mode === 'consent') {
+        const name = m.querySelector('#cc-name').value.trim();
+        if (!name) return toast('Enter a connector name', 'error');
+        const r = await api('POST', '/api/connectors/consent-link', { name });
+        showConsentLink(r.consentUrl, r.redirectUri);
+        return;
+      }
       await api('POST', '/api/connectors', {
         name: m.querySelector('#c-name').value.trim(),
         tenantId: m.querySelector('#c-tenant').value.trim(),

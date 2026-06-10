@@ -19,6 +19,7 @@ the entire migration engine runs in Workers and Durable Objects.
 | **Rules & settings** | Inbox rules (folder ids remapped), Outlook master categories, mailbox settings (auto-reply, time zone, working hours, locale) |
 | **Provisioning** | Create destination accounts in bulk with one-time passwords and license assignment (SKU picker) |
 | **Assessment** | Pre-migration sizing (mailbox item counts, OneDrive usage) and destination readiness checks — writes nothing |
+| **Tenant onboarding** | BitTitan-style **admin consent links**: one multi-tenant app, a Global Admin clicks approve, the connector binds itself — or manual per-tenant app registrations if preferred |
 
 ### Migration model (BitTitan-style)
 
@@ -83,10 +84,14 @@ npm run db:migrate
 npm run deploy
 ```
 
-Then register an Entra ID app in **each** tenant (exact Graph application permissions and
-consent steps in [docs/setup.md](docs/setup.md)), open the deployed URL, paste your API
-token, add the two connectors, create a project — and follow the
-[M&A runbook](docs/runbook.md).
+Then connect your tenants — either with **admin consent links** (one multi-tenant app,
+recommended; see Option A in [docs/setup.md](docs/setup.md)) or manual per-tenant app
+registrations (Option B) — open the deployed URL, paste your API token, create a project,
+and follow the [M&A runbook](docs/runbook.md).
+
+**CI deploys:** `.github/workflows/deploy.yml` auto-deploys on push once you add a
+`CLOUDFLARE_API_TOKEN` repository secret (it also applies D1 migrations, ensures queues
+exist, and syncs optional `DOLOP_*` secrets).
 
 > **Production hardening:** put the Worker behind
 > [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/policies/access/) so the

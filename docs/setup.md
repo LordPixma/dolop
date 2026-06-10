@@ -1,10 +1,52 @@
 # Setup guide
 
-Dolop talks to both tenants app-only (client credentials), so each tenant needs one Entra ID
-app registration with **application** permissions and admin consent. The Cloudflare side is a
-single Worker plus D1/KV/R2/Queues.
+Dolop talks to both tenants app-only (client credentials). There are two ways to connect a
+tenant; the Cloudflare side is the same either way (a single Worker plus D1/KV/R2/Queues).
 
-## 1. Entra ID app registration (repeat in BOTH tenants)
+| | Option A — admin consent link (recommended) | Option B — manual per-tenant apps |
+| --- | --- | --- |
+| Setup in each tenant | A Global Admin clicks one link | Register an app, add 10 permissions, consent, copy 3 values |
+| App registrations needed | **One**, in your home tenant, once | One per tenant |
+| Secrets handled | None per tenant (one Worker secret) | One client secret per tenant (AES-encrypted in D1) |
+| Best for | M&A counterparties, repeat use, MSPs | Orgs that mandate their own app registration |
+
+## Option A — one multi-tenant app + admin consent links
+
+This is how BitTitan/ShareGate onboard tenants: Dolop owns **one** multi-tenant app; a
+target tenant's Global Administrator approves a consent link and the tenant connects itself
+— no registration or secret on their side.
+
+One-time setup in **your home tenant** (any tenant you control — it does not have to be the
+source or destination):
+
+1. **App registrations → New registration**
+   - Name: `dolop`
+   - Supported account types: **Accounts in any organizational directory (multitenant)**
+   - Redirect URI: *Web* → `https://<your-worker-host>/api/consent/callback`
+2. **Certificates & secrets** → create a client secret.
+3. **API permissions → Microsoft Graph → Application permissions**: add the full table from
+   Option B below (these are what consent links request via `.default`), then grant admin
+   consent in your home tenant if you'll also migrate to/from it.
+4. Set the Worker secrets:
+
+   ```sh
+   wrangler secret put MT_CLIENT_ID      # the app's client id
+   wrangler secret put MT_CLIENT_SECRET  # the secret value
+   ```
+
+Then in the dashboard: **Connectors → Add connector → Admin consent link**, name it,
+and send the generated link to the target tenant's Global Admin. When they approve,
+Microsoft redirects to the callback, dolop binds their tenant id (the link is HMAC-signed
+and single-purpose), verifies connectivity, and the connector goes green. If verification
+races service-principal propagation, click **Verify** a minute later.
+
+> Note: with Option A a single app identity can access every consented tenant. For
+> stricter isolation between engagements, use Option B, and either way consider Exchange
+> [application access policies](https://learn.microsoft.com/en-us/graph/auth-limit-mailbox-access)
+> to scope mailbox access. Tenants can revoke at any time by deleting the enterprise
+> application from their directory.
+
+## Option B — Entra ID app registration (repeat in BOTH tenants)
 
 1. **Entra admin center → App registrations → New registration**
    - Name: `dolop-migration`

@@ -31,6 +31,7 @@ interface ConnectorRow {
   tenant_id: string;
   client_id: string;
   client_secret_enc: string;
+  auth_mode: string;
   verify_status: string;
   verify_detail: string | null;
   last_verified_at: string | null;
@@ -44,6 +45,7 @@ function rowToConnector(r: ConnectorRow): Connector & { clientSecretEnc: string 
     tenantId: r.tenant_id,
     clientId: r.client_id,
     clientSecretEnc: r.client_secret_enc,
+    authMode: (r.auth_mode as Connector['authMode']) ?? 'secret',
     verifyStatus: r.verify_status as Connector['verifyStatus'],
     verifyDetail: r.verify_detail ?? undefined,
     lastVerifiedAt: r.last_verified_at ?? undefined,
@@ -53,18 +55,47 @@ function rowToConnector(r: ConnectorRow): Connector & { clientSecretEnc: string 
 
 export async function createConnector(
   db: D1Database,
-  data: { name: string; tenantId: string; clientId: string; clientSecretEnc: string }
+  data: {
+    name: string;
+    tenantId: string;
+    clientId: string;
+    clientSecretEnc: string;
+    authMode?: 'secret' | 'consent';
+    verifyStatus?: string;
+  }
 ): Promise<string> {
   const id = newId('con');
   const now = nowIso();
   await db
     .prepare(
-      `INSERT INTO connectors (id, name, tenant_id, client_id, client_secret_enc, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO connectors (id, name, tenant_id, client_id, client_secret_enc, auth_mode, verify_status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
-    .bind(id, data.name, data.tenantId, data.clientId, data.clientSecretEnc, now, now)
+    .bind(
+      id,
+      data.name,
+      data.tenantId,
+      data.clientId,
+      data.clientSecretEnc,
+      data.authMode ?? 'secret',
+      data.verifyStatus ?? 'unverified',
+      now,
+      now
+    )
     .run();
   return id;
+}
+
+/** Bind the tenant granted via admin consent to a pending consent connector. */
+export async function bindConsentTenant(
+  db: D1Database,
+  id: string,
+  tenantId: string
+): Promise<void> {
+  await db
+    .prepare(`UPDATE connectors SET tenant_id = ?, verify_status = 'unverified', updated_at = ? WHERE id = ?`)
+    .bind(tenantId, nowIso(), id)
+    .run();
 }
 
 export async function listConnectors(db: D1Database): Promise<Connector[]> {

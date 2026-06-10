@@ -37,8 +37,10 @@ M365 moves, and where the honest gaps are.
 
 ## Operating notes
 
-- Graph application access means **no per-user credentials** are ever collected (BitTitan
-  asks for admin creds; dolop asks for app registrations — consent once, revoke any time).
+- Graph application access means **no per-user credentials** are ever collected. Tenant
+  onboarding matches BitTitan's model: send the tenant's Global Admin a consent link and the
+  connector binds itself (or register a per-tenant app manually if the org requires it);
+  consent can be revoked any time by deleting the enterprise application.
 - Mailbox throughput is bounded by Microsoft Graph mailbox-level throttling, the same wall
   every Graph-based tool hits; pre-stage early and rely on delta passes rather than expecting
   cutover-day bulk speed.

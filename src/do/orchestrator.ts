@@ -49,6 +49,13 @@ import type {
 import { ALL_WORKLOADS, emptyWorkloadStats } from '../types';
 import { backoffMs, nowIso } from '../util';
 
+interface JobConnector {
+  tenantId: string;
+  clientId: string;
+  secretEnc: string;
+  authMode: 'secret' | 'consent';
+}
+
 interface JobState {
   projectId: string;
   userId: string;
@@ -59,8 +66,8 @@ interface JobState {
   destUpn: string;
   sourceId?: string;
   destId?: string;
-  source: { tenantId: string; clientId: string; secretEnc: string };
-  dest: { tenantId: string; clientId: string; secretEnc: string };
+  source: JobConnector;
+  dest: JobConnector;
 }
 
 const TICK_DELAY_MS = 250;
@@ -157,6 +164,14 @@ export class MigrationOrchestrator extends DurableObject<Env> {
     if (!srcCon || !dstCon) {
       return Response.json({ error: 'connector not found' }, { status: 400 });
     }
+    for (const con of [srcCon, dstCon]) {
+      if (con.authMode === 'consent' && !con.tenantId) {
+        return Response.json(
+          { error: `connector ${con.name} is still waiting for admin consent` },
+          { status: 400 }
+        );
+      }
+    }
 
     const workloads: (Workload | 'assessment')[] =
       pass.passType === 'assessment'
@@ -193,8 +208,18 @@ export class MigrationOrchestrator extends DurableObject<Env> {
       destUpn: user.destUpn,
       sourceId: user.sourceId,
       destId: user.destId,
-      source: { tenantId: srcCon.tenantId, clientId: srcCon.clientId, secretEnc: srcCon.clientSecretEnc },
-      dest: { tenantId: dstCon.tenantId, clientId: dstCon.clientId, secretEnc: dstCon.clientSecretEnc },
+      source: {
+        tenantId: srcCon.tenantId,
+        clientId: srcCon.clientId,
+        secretEnc: srcCon.clientSecretEnc,
+        authMode: srcCon.authMode,
+      },
+      dest: {
+        tenantId: dstCon.tenantId,
+        clientId: dstCon.clientId,
+        secretEnc: dstCon.clientSecretEnc,
+        authMode: dstCon.authMode,
+      },
     };
     this.store.setJson('sys:job', job);
 
@@ -250,18 +275,8 @@ export class MigrationOrchestrator extends DurableObject<Env> {
 
     const reporter = new StatsReporter(this.store.getJson<UserStats>('sys:stats') ?? {});
     try {
-      const [srcSecret, dstSecret] = await Promise.all([
-        decryptSecret(job.source.secretEnc, this.env.ENCRYPTION_KEY),
-        decryptSecret(job.dest.secretEnc, this.env.ENCRYPTION_KEY),
-      ]);
-      const source = new GraphClient(
-        { tenantId: job.source.tenantId, clientId: job.source.clientId, clientSecret: srcSecret },
-        this.env.KV
-      );
-      const dest = new GraphClient(
-        { tenantId: job.dest.tenantId, clientId: job.dest.clientId, clientSecret: dstSecret },
-        this.env.KV
-      );
+      const source = new GraphClient(await this.resolveCreds(job.source), this.env.KV);
+      const dest = new GraphClient(await this.resolveCreds(job.dest), this.env.KV);
 
       if (!job.sourceId) await this.resolveUsers(job, source, dest);
 
@@ -323,6 +338,26 @@ export class MigrationOrchestrator extends DurableObject<Env> {
       }).catch(() => undefined);
       await this.ctx.storage.setAlarm(Date.now() + backoffMs(failures, 2000));
     }
+  }
+
+  private async resolveCreds(
+    con: JobConnector
+  ): Promise<{ tenantId: string; clientId: string; clientSecret: string }> {
+    if (con.authMode === 'consent') {
+      if (!this.env.MT_CLIENT_ID || !this.env.MT_CLIENT_SECRET) {
+        throw new GraphAuthError('MT_CLIENT_ID/MT_CLIENT_SECRET secrets are not configured');
+      }
+      return {
+        tenantId: con.tenantId,
+        clientId: this.env.MT_CLIENT_ID,
+        clientSecret: this.env.MT_CLIENT_SECRET,
+      };
+    }
+    return {
+      tenantId: con.tenantId,
+      clientId: con.clientId,
+      clientSecret: await decryptSecret(con.secretEnc, this.env.ENCRYPTION_KEY),
+    };
   }
 
   private async resolveUsers(job: JobState, source: GraphClient, dest: GraphClient): Promise<void> {

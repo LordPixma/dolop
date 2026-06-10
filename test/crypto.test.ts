@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decryptSecret, encryptSecret } from '../src/crypto';
+import { decryptSecret, encryptSecret, signState, verifyState } from '../src/crypto';
 
 function randomKey(): string {
   const bytes = new Uint8Array(32);
@@ -33,5 +33,29 @@ describe('secret encryption', () => {
   it('rejects malformed keys and payloads', async () => {
     await expect(encryptSecret('x', btoa('short'))).rejects.toThrow(/32 bytes/);
     await expect(decryptSecret('garbage', randomKey())).rejects.toThrow(/unrecognized/);
+  });
+});
+
+describe('signed consent state', () => {
+  it('round-trips a payload', async () => {
+    const key = randomKey();
+    const state = await signState({ cid: 'con_abc123' }, key);
+    expect(await verifyState(state, key)).toEqual({ cid: 'con_abc123' });
+  });
+
+  it('rejects tampering and wrong keys', async () => {
+    const key = randomKey();
+    const state = await signState({ cid: 'con_abc123' }, key);
+    expect(await verifyState(state, randomKey())).toBeNull();
+    const [body, sig] = state.split('.');
+    const tampered = `${body!.slice(0, -2)}xx.${sig}`;
+    expect(await verifyState(tampered, key)).toBeNull();
+    expect(await verifyState('not-a-state', key)).toBeNull();
+  });
+
+  it('rejects expired state', async () => {
+    const key = randomKey();
+    const state = await signState({ cid: 'con_abc123' }, key, -1000);
+    expect(await verifyState(state, key)).toBeNull();
   });
 });

@@ -9,8 +9,19 @@ import { projectsApi } from './api/projects';
 import { reportsApi } from './api/reports';
 import { usersApi } from './api/users';
 import { requireAuth } from './auth';
-import { getProject, listAllProjectUsers, listProjects, logEvent, updateUserStatus } from './db';
-import { GraphAuthError, GraphError } from './graph/client';
+import { verifyState } from './crypto';
+import {
+  bindConsentTenant,
+  getConnector,
+  getProject,
+  listAllProjectUsers,
+  listProjects,
+  logEvent,
+  updateConnectorVerify,
+  updateUserStatus,
+} from './db';
+import { GraphAuthError, GraphClient, GraphError } from './graph/client';
+import type { Organization } from './graph/types';
 import type { CoordinatorEnqueueBody, Env, PassConfig, QueueMessage } from './types';
 
 export { MigrationOrchestrator } from './do/orchestrator';
@@ -19,6 +30,66 @@ export { ProjectCoordinator } from './do/coordinator';
 const app = new Hono<{ Bindings: Env }>();
 
 app.get('/api/health', (c) => c.json({ ok: true, service: 'dolop' }));
+
+function consentPage(title: string, detail: string, ok: boolean): Response {
+  return new Response(
+    `<!doctype html><html><head><meta charset="utf-8"><title>dolop</title>
+     <style>body{font-family:system-ui;background:#0d1117;color:#e6edf3;display:grid;place-items:center;min-height:90vh}
+     .box{max-width:460px;background:#161b22;border:1px solid #2d3646;border-radius:10px;padding:2rem;text-align:center}
+     a{color:#58a6ff}</style></head><body><div class="box">
+     <h2>${ok ? '✅' : '⚠️'} ${title}</h2><p>${detail}</p>
+     <p><a href="/#/connectors">Open the dolop dashboard</a></p></div></body></html>`,
+    { status: ok ? 200 : 400, headers: { 'content-type': 'text/html; charset=utf-8' } }
+  );
+}
+
+// Admin-consent return leg. Unauthenticated by design: the person consenting is
+// the *target tenant's* Global Admin, not necessarily a dolop operator. The
+// HMAC-signed state parameter is what authenticates the request.
+app.get('/api/consent/callback', async (c) => {
+  const q = c.req.query();
+  if (q.error) {
+    return consentPage('Consent was not granted', q.error_description ?? q.error ?? 'unknown error', false);
+  }
+  if (q.admin_consent !== 'True' || !q.tenant || !q.state) {
+    return consentPage('Incomplete response', 'Microsoft did not confirm admin consent.', false);
+  }
+  const payload = await verifyState(q.state, c.env.ENCRYPTION_KEY);
+  if (!payload?.cid) {
+    return consentPage('Invalid or expired link', 'Ask the dolop operator for a fresh consent link.', false);
+  }
+  const connector = await getConnector(c.env.DB, payload.cid);
+  if (!connector || connector.authMode !== 'consent') {
+    return consentPage('Unknown connector', 'This consent link does not match any pending connector.', false);
+  }
+  await bindConsentTenant(c.env.DB, connector.id, q.tenant);
+
+  // Best-effort immediate verification; the service principal can take a
+  // minute to propagate, so failure here is not fatal.
+  let detail = 'Consent received. The dolop operator can now verify and use this connector.';
+  if (c.env.MT_CLIENT_ID && c.env.MT_CLIENT_SECRET) {
+    try {
+      const client = new GraphClient(
+        { tenantId: q.tenant, clientId: c.env.MT_CLIENT_ID, clientSecret: c.env.MT_CLIENT_SECRET },
+        c.env.KV
+      );
+      const org = await client.get<{ value: Organization[] }>('/organization?$select=displayName,verifiedDomains');
+      const tenant = org.value?.[0];
+      const domains = (tenant?.verifiedDomains ?? []).map((d) => d.name).filter(Boolean).join(', ');
+      await updateConnectorVerify(c.env.DB, connector.id, 'ok', `${tenant?.displayName ?? 'tenant'} (${domains})`);
+      detail = `Connected to ${tenant?.displayName ?? q.tenant}. You can close this window.`;
+    } catch {
+      await updateConnectorVerify(
+        c.env.DB,
+        connector.id,
+        'failed',
+        'consent received; first verification failed (service principal may still be propagating) — click Verify in a minute'
+      );
+    }
+  }
+  await logEvent(c.env.DB, { message: `admin consent granted for connector ${connector.name} (tenant ${q.tenant})` }).catch(() => undefined);
+  return consentPage('Tenant connected', detail, true);
+});
 
 app.use('/api/*', requireAuth);
 app.route('/api/connectors', connectorsApi);

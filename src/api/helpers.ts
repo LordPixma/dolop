@@ -2,7 +2,7 @@
 
 import { decryptSecret } from '../crypto';
 import { getConnector, getProject } from '../db';
-import { GraphClient } from '../graph/client';
+import { GraphClient, type GraphCredentials } from '../graph/client';
 import type { Connector, Env, Project } from '../types';
 
 export class ApiError extends Error {
@@ -18,6 +18,34 @@ export async function loadProject(env: Env, projectId: string): Promise<Project>
   return project;
 }
 
+/** Resolve Graph credentials for a connector based on its auth mode. */
+export async function credsForConnector(
+  env: Env,
+  connector: Connector & { clientSecretEnc: string }
+): Promise<GraphCredentials> {
+  if (connector.authMode === 'consent') {
+    if (!env.MT_CLIENT_ID || !env.MT_CLIENT_SECRET) {
+      throw new ApiError(
+        422,
+        'consent-mode connector but MT_CLIENT_ID/MT_CLIENT_SECRET secrets are not configured'
+      );
+    }
+    if (!connector.tenantId) {
+      throw new ApiError(422, 'tenant has not granted consent yet — send the admin consent link first');
+    }
+    return {
+      tenantId: connector.tenantId,
+      clientId: env.MT_CLIENT_ID,
+      clientSecret: env.MT_CLIENT_SECRET,
+    };
+  }
+  return {
+    tenantId: connector.tenantId,
+    clientId: connector.clientId,
+    clientSecret: await decryptSecret(connector.clientSecretEnc, env.ENCRYPTION_KEY),
+  };
+}
+
 export async function graphForConnector(
   env: Env,
   connectorId: string | undefined,
@@ -26,12 +54,8 @@ export async function graphForConnector(
   if (!connectorId) throw new ApiError(400, `project has no ${role} connector configured`);
   const connector = await getConnector(env.DB, connectorId);
   if (!connector) throw new ApiError(404, `${role} connector not found`);
-  const clientSecret = await decryptSecret(connector.clientSecretEnc, env.ENCRYPTION_KEY);
   return {
-    client: new GraphClient(
-      { tenantId: connector.tenantId, clientId: connector.clientId, clientSecret },
-      env.KV
-    ),
+    client: new GraphClient(await credsForConnector(env, connector), env.KV),
     connector,
   };
 }

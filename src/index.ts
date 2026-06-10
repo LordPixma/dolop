@@ -109,7 +109,10 @@ app.onError((err, c) => {
     return c.json({ error: `Microsoft Graph: ${err.code}: ${err.message}` }, 502);
   }
   console.error('unhandled API error', err);
-  return c.json({ error: 'internal error' }, 500);
+  // Operator-facing admin tool: surface the underlying message so failures are
+  // diagnosable from the dashboard instead of requiring a wrangler tail.
+  const message = err instanceof Error ? err.message : String(err);
+  return c.json({ error: `internal error: ${message}` }, 500);
 });
 
 // Non-API requests are served by static assets (run_worker_first limits the

@@ -7,6 +7,11 @@
 #   DOLOP_API_TOKEN       — dashboard/API bearer token
 #   DOLOP_ENCRYPTION_KEY  — base64 32-byte AES key (openssl rand -base64 32)
 #   DOLOP_MT_CLIENT_ID / DOLOP_MT_CLIENT_SECRET — multi-tenant app for admin-consent connectors
+#
+# WARNING: these values are re-applied on EVERY deploy. If DOLOP_ENCRYPTION_KEY
+# differs from the key the Worker was using, all stored connector secrets become
+# undecryptable and must be re-entered (Connectors → Rotate secret). Set it once,
+# before creating connectors, and never change it casually.
 
 name: deploy
 

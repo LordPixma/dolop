@@ -372,11 +372,18 @@ export class MigrationOrchestrator extends DurableObject<Env> {
         clientSecret: this.env.MT_CLIENT_SECRET,
       };
     }
-    return {
-      tenantId: con.tenantId,
-      clientId: con.clientId,
-      clientSecret: await decryptSecret(con.secretEnc, this.env.ENCRYPTION_KEY),
-    };
+    try {
+      return {
+        tenantId: con.tenantId,
+        clientId: con.clientId,
+        clientSecret: await decryptSecret(con.secretEnc, this.env.ENCRYPTION_KEY),
+      };
+    } catch {
+      throw new GraphAuthError(
+        'could not decrypt the stored connector secret — ENCRYPTION_KEY has changed since the ' +
+          'connector was saved. Rotate the connector secret in the dashboard, then retry.'
+      );
+    }
   }
 
   private async resolveUsers(job: JobState, source: GraphClient, dest: GraphClient): Promise<void> {

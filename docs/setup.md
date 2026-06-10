@@ -103,8 +103,9 @@ openssl rand -hex 32    | wrangler secret put API_TOKEN
 ```
 
 - `ENCRYPTION_KEY` — AES-256-GCM master key; tenant client secrets are encrypted with it
-  before touching D1. Losing it means re-entering connector secrets. It also signs admin
-  consent state and is required for session auth, so set it before first use.
+  before touching D1. **Set it once and treat it as permanent**: if it changes (including a
+  CI deploy syncing a different `DOLOP_ENCRYPTION_KEY` GitHub secret), every stored connector
+  secret becomes undecryptable and must be re-entered via *Connectors → Rotate secret*.
 - `API_TOKEN` — bearer token for the API. Day-to-day dashboard access uses username/password
   accounts (created on first visit); the token is for automation/CI and for resetting
   operator passwords if they're all forgotten (sign in with the token → Account → Team →

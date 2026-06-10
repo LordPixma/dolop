@@ -39,11 +39,21 @@ export async function credsForConnector(
       clientSecret: env.MT_CLIENT_SECRET,
     };
   }
-  return {
-    tenantId: connector.tenantId,
-    clientId: connector.clientId,
-    clientSecret: await decryptSecret(connector.clientSecretEnc, env.ENCRYPTION_KEY),
-  };
+  try {
+    return {
+      tenantId: connector.tenantId,
+      clientId: connector.clientId,
+      clientSecret: await decryptSecret(connector.clientSecretEnc, env.ENCRYPTION_KEY),
+    };
+  } catch {
+    throw new ApiError(
+      422,
+      `could not decrypt the stored client secret for connector "${connector.name}" — the ` +
+        'ENCRYPTION_KEY secret has changed since it was saved (e.g. a CI deploy synced a ' +
+        'different DOLOP_ENCRYPTION_KEY). Re-enter the client secret (Connectors → Rotate ' +
+        'secret), then Verify.'
+    );
+  }
 }
 
 export async function graphForConnector(

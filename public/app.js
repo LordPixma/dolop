@@ -9,7 +9,8 @@ const TOKEN_KEY = 'dolop_token';
 function getToken() { return localStorage.getItem(TOKEN_KEY) || ''; }
 
 async function api(method, path, body, opts = {}) {
-  const headers = { authorization: `Bearer ${getToken()}` };
+  const headers = {};
+  if (getToken()) headers.authorization = `Bearer ${getToken()}`; // optional API-token mode
   let payload;
   if (body !== undefined) {
     if (opts.raw) {
@@ -21,8 +22,8 @@ async function api(method, path, body, opts = {}) {
     }
   }
   const res = await fetch(path, { method, headers, body: payload });
-  if (res.status === 401) {
-    renderTokenGate();
+  if (res.status === 401 && !opts.noRedirect) {
+    renderLogin();
     throw new Error('unauthorized');
   }
   if (opts.blob) {
@@ -105,29 +106,181 @@ const WORKLOAD_LABELS = {
 };
 
 // ---------------------------------------------------------------------------
-// Token gate
+// Sign-in (username/password sessions; API token as fallback/recovery)
 
-function renderTokenGate() {
+async function renderLogin() {
   stopPolling();
+  let status = { setupRequired: false };
+  try { status = await fetch('/api/auth/status').then((r) => r.json()); } catch { /* show login anyway */ }
+
+  if (status.setupRequired) {
+    $app.innerHTML = `
+      <div class="card" style="max-width:460px;margin:8vh auto">
+        <h1>Welcome to dolop</h1>
+        <p class="sub">No operator accounts exist yet. Create the first administrator account for this deployment.</p>
+        <label>Username</label><input id="su-user" autocomplete="username" autofocus />
+        <label>Display name</label><input id="su-name" autocomplete="name" />
+        <label>Password <span class="muted">(min 10 characters)</span></label>
+        <input type="password" id="su-pass" autocomplete="new-password" />
+        <label>Confirm password</label><input type="password" id="su-pass2" autocomplete="new-password" />
+        <div class="btnrow" style="margin-top:1rem"><button class="primary" id="su-go">Create account</button></div>
+      </div>`;
+    document.getElementById('su-go').addEventListener('click', async () => {
+      const password = document.getElementById('su-pass').value;
+      if (password !== document.getElementById('su-pass2').value) return toast('Passwords do not match', 'error');
+      try {
+        const res = await fetch('/api/auth/setup', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            username: document.getElementById('su-user').value.trim(),
+            displayName: document.getElementById('su-name').value.trim() || undefined,
+            password,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) return toast(data.error || 'setup failed', 'error');
+        toast('Account created — welcome!', 'ok');
+        route();
+      } catch (e) { toast(e.message, 'error'); }
+    });
+    return;
+  }
+
   $app.innerHTML = `
-    <div class="card" style="max-width:460px;margin:8vh auto">
-      <h1>Welcome to dolop</h1>
-      <p class="sub">Enter the API token configured for this deployment (<code>wrangler secret put API_TOKEN</code>).</p>
-      <label>API token</label>
-      <input type="password" id="tok" placeholder="paste token" autofocus />
-      <div class="btnrow" style="margin-top:1rem">
-        <button class="primary" id="tok-save">Continue</button>
+    <div class="card" style="max-width:420px;margin:8vh auto">
+      <h1>Sign in to dolop</h1>
+      <label>Username</label><input id="li-user" autocomplete="username" autofocus />
+      <label>Password</label><input type="password" id="li-pass" autocomplete="current-password" />
+      <div class="btnrow" style="margin-top:1rem"><button class="primary" id="li-go">Sign in</button></div>
+      <p class="sub" style="margin-top:1rem"><a href="#" id="li-token-toggle">Use an API token instead</a></p>
+      <div id="li-token-pane" style="display:none">
+        <label>API token <span class="muted">(also resets forgotten passwords via Account → Team)</span></label>
+        <input type="password" id="li-token" />
+        <div class="btnrow" style="margin-top:.7rem"><button id="li-token-go">Continue with token</button></div>
       </div>
     </div>`;
-  const save = async () => {
-    localStorage.setItem(TOKEN_KEY, document.getElementById('tok').value.trim());
+  const login = async () => {
     try {
-      await api('GET', '/api/projects');
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          username: document.getElementById('li-user').value.trim(),
+          password: document.getElementById('li-pass').value,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) return toast(data.error || 'sign-in failed', 'error');
+      localStorage.removeItem(TOKEN_KEY);
+      route();
+    } catch (e) { toast(e.message, 'error'); }
+  };
+  document.getElementById('li-go').addEventListener('click', login);
+  document.getElementById('li-pass').addEventListener('keydown', (e) => { if (e.key === 'Enter') login(); });
+  document.getElementById('li-token-toggle').addEventListener('click', (e) => {
+    e.preventDefault();
+    const pane = document.getElementById('li-token-pane');
+    pane.style.display = pane.style.display === 'none' ? 'block' : 'none';
+  });
+  document.getElementById('li-token-go').addEventListener('click', async () => {
+    localStorage.setItem(TOKEN_KEY, document.getElementById('li-token').value.trim());
+    try {
+      await api('GET', '/api/projects', undefined, { noRedirect: true });
       route();
     } catch { toast('Token rejected', 'error'); }
-  };
-  document.getElementById('tok-save').addEventListener('click', save);
-  document.getElementById('tok').addEventListener('keydown', (e) => { if (e.key === 'Enter') save(); });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Account & team page
+
+async function viewAccount() {
+  const status = await fetch('/api/auth/status').then((r) => r.json());
+  const { accounts } = await api('GET', '/api/auth/accounts');
+  const me = status.account;
+  const rows = accounts.map((a) => `
+    <tr>
+      <td><strong>${esc(a.username)}</strong>${me && me.id === a.id ? ' <span class="muted">(you)</span>' : ''}
+        <div class="muted" style="font-size:.76rem">${esc(a.displayName || '')}</div></td>
+      <td class="muted" style="font-size:.8rem">${a.lastLoginAt ? fmtDate(a.lastLoginAt) : 'never signed in'}</td>
+      <td class="right">
+        <button class="small" data-reset="${a.id}" data-username="${esc(a.username)}">Reset password</button>
+        ${me && me.id === a.id ? '' : `<button class="small danger" data-del="${a.id}" data-username="${esc(a.username)}">Delete</button>`}
+      </td>
+    </tr>`).join('');
+  $app.innerHTML = `
+    <div class="page-head">
+      <div><h1>Account</h1>
+      <div class="sub">${me ? `Signed in as <strong>${esc(me.username)}</strong>` : 'Authenticated with the API token'}</div></div>
+    </div>
+    ${me ? `
+    <div class="card" style="max-width:480px">
+      <h3>Change password</h3>
+      <label>Current password</label><input type="password" id="cp-cur" autocomplete="current-password" />
+      <label>New password <span class="muted">(min 10 characters)</span></label>
+      <input type="password" id="cp-new" autocomplete="new-password" />
+      <div class="btnrow" style="margin-top:.9rem"><button class="primary" id="cp-go">Update password</button></div>
+    </div>` : ''}
+    <div class="card">
+      <div class="page-head" style="margin-bottom:.6rem">
+        <h3 style="margin:0">Team</h3>
+        <button class="primary" id="ac-add">Add operator</button>
+      </div>
+      <table><thead><tr><th>Username</th><th>Last sign-in</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+    </div>`;
+  const cp = document.getElementById('cp-go');
+  if (cp) cp.addEventListener('click', async () => {
+    try {
+      await api('POST', '/api/auth/change-password', {
+        currentPassword: document.getElementById('cp-cur').value,
+        newPassword: document.getElementById('cp-new').value,
+      });
+      toast('Password updated', 'ok');
+      viewAccount();
+    } catch (e) { toast(e.message, 'error'); }
+  });
+  document.getElementById('ac-add').addEventListener('click', () => {
+    const m = modal(`
+      <h2>Add operator account</h2>
+      <label>Username</label><input id="na-user" />
+      <label>Display name</label><input id="na-name" />
+      <label>Password <span class="muted">(min 10 characters — share securely; they can change it after signing in)</span></label>
+      <input id="na-pass" type="password" />
+      <div class="actions"><button id="m-cancel">Cancel</button><button class="primary" id="m-save">Create</button></div>`);
+    m.querySelector('#m-cancel').addEventListener('click', closeModal);
+    m.querySelector('#m-save').addEventListener('click', async () => {
+      try {
+        await api('POST', '/api/auth/accounts', {
+          username: m.querySelector('#na-user').value.trim(),
+          displayName: m.querySelector('#na-name').value.trim() || undefined,
+          password: m.querySelector('#na-pass').value,
+        });
+        closeModal(); toast('Operator account created', 'ok'); viewAccount();
+      } catch (e) { toast(e.message, 'error'); }
+    });
+  });
+  $app.querySelectorAll('[data-reset]').forEach((b) => b.addEventListener('click', () => {
+    const m = modal(`
+      <h2>Reset password for ${esc(b.dataset.username)}</h2>
+      <label>New password <span class="muted">(min 10 characters)</span></label>
+      <input id="rp-pass" type="password" />
+      <div class="actions"><button id="m-cancel">Cancel</button><button class="primary" id="m-save">Reset</button></div>`);
+    m.querySelector('#m-cancel').addEventListener('click', closeModal);
+    m.querySelector('#m-save').addEventListener('click', async () => {
+      try {
+        await api('POST', `/api/auth/accounts/${b.dataset.reset}/reset-password`, {
+          newPassword: m.querySelector('#rp-pass').value,
+        });
+        closeModal(); toast('Password reset', 'ok');
+      } catch (e) { toast(e.message, 'error'); }
+    });
+  }));
+  $app.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm(`Delete operator account "${b.dataset.username}"?`)) return;
+    try { await api('DELETE', `/api/auth/accounts/${b.dataset.del}`); viewAccount(); }
+    catch (e) { toast(e.message, 'error'); }
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -816,12 +969,12 @@ async function tabSettings(c, project, data) {
 
 async function route() {
   stopPolling();
-  if (!getToken()) { renderTokenGate(); return; }
   const hash = location.hash.replace(/^#\/?/, '');
   const parts = hash.split('/').filter(Boolean);
   try {
     if (parts.length === 0) await viewProjects();
     else if (parts[0] === 'connectors') await viewConnectors();
+    else if (parts[0] === 'account') await viewAccount();
     else if (parts[0] === 'projects' && parts[1]) await viewProject(parts[1], parts[2] || 'users');
     else await viewProjects();
   } catch (e) {
@@ -832,9 +985,10 @@ async function route() {
 }
 
 window.addEventListener('hashchange', route);
-document.getElementById('signout').addEventListener('click', (e) => {
+document.getElementById('signout').addEventListener('click', async (e) => {
   e.preventDefault();
   localStorage.removeItem(TOKEN_KEY);
-  renderTokenGate();
+  try { await fetch('/api/auth/logout', { method: 'POST' }); } catch { /* session may already be gone */ }
+  renderLogin();
 });
 route();

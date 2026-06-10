@@ -2,6 +2,7 @@
 // and cron handler (auto-delta scheduling + stalled-migration watchdog).
 
 import { Hono } from 'hono';
+import { authApi } from './api/auth';
 import { connectorsApi } from './api/connectors';
 import { ApiError } from './api/helpers';
 import { migrationsApi } from './api/migrations';
@@ -90,6 +91,9 @@ app.get('/api/consent/callback', async (c) => {
   await logEvent(c.env.DB, { message: `admin consent granted for connector ${connector.name} (tenant ${q.tenant})` }).catch(() => undefined);
   return consentPage('Tenant connected', detail, true);
 });
+
+// Auth routes manage their own access rules (login/setup must be public).
+app.route('/api/auth', authApi);
 
 app.use('/api/*', requireAuth);
 app.route('/api/connectors', connectorsApi);

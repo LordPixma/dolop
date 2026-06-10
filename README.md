@@ -84,10 +84,15 @@ npm run db:migrate
 npm run deploy
 ```
 
+Open the deployed URL — the first visit walks you through creating the initial
+**administrator account** (username/password; PBKDF2-hashed, HttpOnly session cookies, login
+rate-limiting). Additional operators are managed under **Account → Team**. The `API_TOKEN`
+secret remains valid as a bearer token for automation/CI and as the recovery path if all
+passwords are lost.
+
 Then connect your tenants — either with **admin consent links** (one multi-tenant app,
 recommended; see Option A in [docs/setup.md](docs/setup.md)) or manual per-tenant app
-registrations (Option B) — open the deployed URL, paste your API token, create a project,
-and follow the [M&A runbook](docs/runbook.md).
+registrations (Option B) — create a project, and follow the [M&A runbook](docs/runbook.md).
 
 **CI deploys:** `.github/workflows/deploy.yml` auto-deploys on push once you add a
 `CLOUDFLARE_API_TOKEN` repository secret (it also applies D1 migrations, ensures queues

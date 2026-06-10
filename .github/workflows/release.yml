@@ -1,0 +1,30 @@
+# Manually-dispatched release: creates the git tag and a GitHub Release at the
+# current tip of the chosen branch, with notes from CHANGELOG.md.
+#
+# Usage: Actions → release → Run workflow → enter the tag (e.g. v0.1.0).
+
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to create (e.g. v0.1.0)'
+        required: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.event.inputs.tag }}" \
+            --target "${{ github.sha }}" \
+            --title "dolop ${{ github.event.inputs.tag }}" \
+            --notes-file CHANGELOG.md

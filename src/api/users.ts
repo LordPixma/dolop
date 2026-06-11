@@ -207,6 +207,37 @@ usersApi.delete('/:projectId/users/:userId', async (c) => {
   return c.json({ ok: true });
 });
 
+// Wipe a user's migration state (id map + delta cursors) without changing the
+// mapping. The next full pass re-copies everything — combine with the
+// mailDedupeByMessageId pass option to converge instead of duplicating.
+usersApi.post('/:projectId/users/:userId/reset', async (c) => {
+  const project = await loadProject(c.env, c.req.param('projectId'));
+  const user = await getUser(c.env.DB, c.req.param('userId'));
+  if (!user || user.projectId !== project.id) throw new ApiError(404, 'user not found');
+  if (user.status === 'running' || user.status === 'queued') {
+    throw new ApiError(409, 'stop the migration for this user before resetting state');
+  }
+  const stub = c.env.ORCHESTRATOR.get(c.env.ORCHESTRATOR.idFromName(`${project.id}/${user.id}`));
+  const res = await stub.fetch('https://do/reset', { method: 'POST', body: '{}' });
+  if (!res.ok) {
+    const detail = ((await res.json().catch(() => ({}))) as { error?: string }).error;
+    throw new ApiError(409, detail ?? 'could not reset migration state');
+  }
+  await updateUserStatus(c.env.DB, user.id, {
+    status: 'pending',
+    error: null,
+    completedAt: null,
+    stats: {},
+    activity: null,
+  });
+  await logEvent(c.env.DB, {
+    projectId: project.id,
+    userId: user.id,
+    message: `migration state reset for ${user.sourceUpn}`,
+  });
+  return c.json({ ok: true });
+});
+
 // Destination tenant license SKUs (for provisioning).
 usersApi.get('/:projectId/skus', async (c) => {
   const project = await loadProject(c.env, c.req.param('projectId'));

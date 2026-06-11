@@ -731,7 +731,8 @@ async function userDetailModal(project, userId) {
     <div class="actions">
       ${user.status === 'running' || user.status === 'queued'
         ? `<button class="danger" id="ud-stop">Stop</button>`
-        : `<button id="ud-start">Start a pass…</button>`}
+        : `<button class="danger" id="ud-reset">Reset state…</button>
+           <button id="ud-start">Start a pass…</button>`}
       <button id="ud-close">Close</button>
     </div>`, { wide: true });
   m.querySelector('#ud-close').addEventListener('click', closeModal);
@@ -772,6 +773,21 @@ async function userDetailModal(project, userId) {
   });
   const startBtn = m.querySelector('#ud-start');
   if (startBtn) startBtn.addEventListener('click', () => { closeModal(); startPassModal(project, [userId]); });
+  const resetBtn = m.querySelector('#ud-reset');
+  if (resetBtn) resetBtn.addEventListener('click', async () => {
+    if (!confirm(
+      'Reset this user\'s migration state (id map and delta cursors)?\n\n' +
+      'The next FULL pass will re-process the entire mailbox. To avoid duplicating ' +
+      'already-migrated mail, start that pass with "Match existing messages by ' +
+      'Message-ID" enabled — existing items are then mapped (and any missing ' +
+      'attachments repaired) instead of copied again.')) return;
+    try {
+      await api('POST', `/api/projects/${project.id}/users/${userId}/reset`, {});
+      toast('Migration state reset', 'ok');
+      closeModal();
+      viewProject(project.id, 'users');
+    } catch (e) { toast(e.message, 'error'); }
+  });
 }
 
 async function discoverModal(project) {
@@ -1019,6 +1035,7 @@ function startPassModal(project, userIds) {
     <label class="inline"><input type="checkbox" id="sp-deleted" /> Include Deleted Items</label>
     <label class="inline"><input type="checkbox" id="sp-junk" /> Include Junk Email</label>
     <label class="inline"><input type="checkbox" id="sp-attendees" /> Preserve event attendees <span class="muted">(may send meeting invitations!)</span></label>
+    <label class="inline"><input type="checkbox" id="sp-dedupe" /> Match existing messages by Message-ID <span class="muted">(use after a state reset — maps existing mail instead of duplicating; slower)</span></label>
     <div class="actions"><button id="m-cancel">Cancel</button><button class="primary" id="m-save">Start</button></div>`);
   const typeSel = m.querySelector('#sp-type');
   typeSel.addEventListener('change', () => {
@@ -1032,6 +1049,7 @@ function startPassModal(project, userIds) {
         excludeDeletedItems: !m.querySelector('#sp-deleted').checked,
         excludeJunk: !m.querySelector('#sp-junk').checked,
         calendarAttendees: m.querySelector('#sp-attendees').checked ? 'preserve' : 'strip',
+        mailDedupeByMessageId: m.querySelector('#sp-dedupe').checked,
       };
       if (passType === 'prestage') {
         const cutoff = m.querySelector('#sp-cutoff').value;

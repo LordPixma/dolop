@@ -170,7 +170,8 @@ export class EngineStore {
   /** Clear per-pass state while keeping idmap + delta cursors (incremental sync). */
   resetPass(): void {
     this.sql.exec(`DELETE FROM kv WHERE k LIKE 'phase:%' OR k LIKE 'state:%'`);
-    this.sql.exec('DELETE FROM work');
+    // Queued attachment repairs survive into the next pass so they self-heal.
+    this.sql.exec(`DELETE FROM work WHERE kind <> 'attretry'`);
   }
 
   /**

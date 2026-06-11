@@ -5,6 +5,7 @@ import {
   csvCell,
   filterSignature,
   isPathExcluded,
+  MAIL_ATTACHMENT_CHUNK_SIZE,
   mapUpnToDomain,
   nextChunkRange,
   parseMappingCsv,
@@ -47,6 +48,10 @@ describe('csv output', () => {
 describe('nextChunkRange', () => {
   it('is aligned to a 320 KiB multiple', () => {
     expect(UPLOAD_CHUNK_SIZE % (320 * 1024)).toBe(0);
+  });
+  it('mail attachment chunks stay 320 KiB-aligned and under the Outlook 4 MB cap', () => {
+    expect(MAIL_ATTACHMENT_CHUNK_SIZE % (320 * 1024)).toBe(0);
+    expect(MAIL_ATTACHMENT_CHUNK_SIZE).toBeLessThan(4 * 1024 * 1024);
   });
   it('walks a file in order and terminates', () => {
     const total = UPLOAD_CHUNK_SIZE * 2 + 5;

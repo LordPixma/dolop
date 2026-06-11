@@ -45,6 +45,12 @@ export interface PassFilters {
   calendarAttendees?: 'strip' | 'preserve';
   /** Drive paths (relative to root, e.g. "Archive/Old") to exclude. Case-insensitive prefix match. */
   driveExcludePaths?: string[];
+  /**
+   * Full passes only: before creating a message, look it up in the destination
+   * by Internet Message-ID and map it instead of duplicating. Use after a
+   * migration-state reset so re-runs converge instead of double-copying.
+   */
+  mailDedupeByMessageId?: boolean;
 }
 
 export interface PassConfig {

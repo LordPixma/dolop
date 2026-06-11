@@ -13,7 +13,13 @@
 
 import { GraphError } from '../graph/client';
 import type { GraphAttachment, GraphMessage, MailFolder } from '../graph/types';
-import { isPathExcluded, filterSignature, LARGE_ATTACHMENT_THRESHOLD, nextChunkRange } from '../util';
+import {
+  isPathExcluded,
+  filterSignature,
+  LARGE_ATTACHMENT_THRESHOLD,
+  MAIL_ATTACHMENT_CHUNK_SIZE,
+  nextChunkRange,
+} from '../util';
 import { buildMessagePayload } from './transform';
 import { putUploadChunk } from './upload';
 import type { MigrationContext, StepResult, WorkloadEngine } from './workload';
@@ -49,7 +55,23 @@ interface AttachmentResume {
   remaining: { id: string; name?: string; size: number }[];
   /** in-flight large attachment upload */
   upload?: { attId: string; sessionUrl: string; offset: number; size: number; name?: string };
+  /** set when this resume is replaying a queued attachment repair */
+  retry?: boolean;
+  workId?: number;
+  tries?: number;
 }
+
+/** A failed attachment copy queued for replay on a later tick or pass. */
+interface AttRetryWork {
+  srcMsgId: string;
+  destMsgId: string;
+  attId: string;
+  name?: string;
+  size: number;
+  tries: number;
+}
+
+const MAX_ATTACHMENT_TRIES = 3;
 
 export class MailEngine implements WorkloadEngine {
   readonly name = 'mail';
@@ -208,18 +230,39 @@ export class MailEngine implements WorkloadEngine {
   private async items(ctx: MigrationContext): Promise<StepResult> {
     const { store } = ctx;
     while (!ctx.budget.exhausted) {
-      const work = store.peekWork<ScanWork>(W, 'scan');
-      if (!work) return 'done';
-      const scan = work.payload;
-      const cursorKey = this.deltaCursorKey(scan.srcFolderId, ctx.pass.filters);
-
       // Resume an interrupted attachment copy before anything else.
       const att = store.getState<AttachmentResume>(W, 'att');
       if (att) {
         await this.copyAttachments(ctx, att);
-        this.finishMessage(ctx, att.srcMsgId, att.destMsgId);
+        if (att.retry) {
+          store.delState(W, 'att');
+          if (att.workId !== undefined) store.popWork(att.workId);
+          ctx.budget.itemDone();
+        } else {
+          this.finishMessage(ctx, att.srcMsgId, att.destMsgId);
+        }
         continue;
       }
+
+      // Replay queued attachment repairs (failures from earlier ticks/passes).
+      const retryWork = store.peekWork<AttRetryWork>(W, 'attretry');
+      if (retryWork) {
+        const r = retryWork.payload;
+        store.setState(W, 'att', {
+          srcMsgId: r.srcMsgId,
+          destMsgId: r.destMsgId,
+          remaining: [{ id: r.attId, name: r.name, size: r.size }],
+          retry: true,
+          workId: retryWork.id,
+          tries: r.tries,
+        } satisfies AttachmentResume);
+        continue;
+      }
+
+      const work = store.peekWork<ScanWork>(W, 'scan');
+      if (!work) return 'done';
+      const scan = work.payload;
+      const cursorKey = this.deltaCursorKey(scan.srcFolderId, ctx.pass.filters);
 
       const pending = store.getState<string[]>(W, 'pending') ?? [];
       if (pending.length > 0) {
@@ -307,6 +350,45 @@ export class MailEngine implements WorkloadEngine {
       return;
     }
 
+    // Optional convergence net: if the destination already holds this message
+    // (matched by Internet Message-ID), map it instead of duplicating. When the
+    // existing copy is missing its attachments (e.g. a pre-fix failure), queue
+    // them for repair.
+    if (ctx.pass.filters.mailDedupeByMessageId && msg.internetMessageId) {
+      try {
+        const safe = msg.internetMessageId.replace(/'/g, "''");
+        const found = await dest.get<{ value: { id: string; hasAttachments?: boolean }[] }>(
+          `${ctx.destUserPath}/messages?$filter=${encodeURIComponent(
+            `internetMessageId eq '${safe}'`
+          )}&$select=id,hasAttachments&$top=1`
+        );
+        const hit = found.value?.[0];
+        if (hit) {
+          store.mapPut(W, 'item', msgId, hit.id);
+          if (msg.hasAttachments && !hit.hasAttachments) {
+            const list = await source.get<{ value: GraphAttachment[] }>(
+              `${ctx.sourceUserPath}/messages/${msgId}/attachments?$select=id,name,contentType,size,isInline`
+            );
+            for (const a of list.value ?? []) {
+              store.pushWork(W, 'attretry', {
+                srcMsgId: msgId,
+                destMsgId: hit.id,
+                attId: a.id,
+                name: a.name,
+                size: a.size ?? 0,
+                tries: 0,
+              } satisfies AttRetryWork);
+            }
+          }
+          report.stat(W, 'skipped');
+          skip();
+          return;
+        }
+      } catch {
+        // dedupe is best-effort — fall through and create the message
+      }
+    }
+
     const asDraft = scan.asDraft || msg.isDraft === true;
     try {
       const created = await dest.post<{ id: string }>(
@@ -345,29 +427,84 @@ export class MailEngine implements WorkloadEngine {
     }
   }
 
+  /**
+   * Record a failed attachment for replay (up to MAX_ATTACHMENT_TRIES across
+   * ticks/passes — the queue survives pass resets). Only after the final
+   * attempt does it count against the user's failed-item stats.
+   */
+  private queueAttachmentRetry(
+    ctx: MigrationContext,
+    att: AttachmentResume,
+    a: { id: string; name?: string; size: number },
+    code: string,
+    message: string
+  ): void {
+    const tries = (att.tries ?? 0) + 1;
+    const final = tries >= MAX_ATTACHMENT_TRIES;
+    ctx.report.itemError(W, {
+      itemType: 'attachment',
+      itemId: a.id,
+      itemName: a.name,
+      code,
+      message: final
+        ? `${message} (giving up after ${tries} attempts)`
+        : `${message} (queued for retry, attempt ${tries}/${MAX_ATTACHMENT_TRIES})`,
+    });
+    if (final) {
+      ctx.report.stat(W, 'failed');
+      return;
+    }
+    ctx.store.pushWork(W, 'attretry', {
+      srcMsgId: att.srcMsgId,
+      destMsgId: att.destMsgId,
+      attId: a.id,
+      name: a.name,
+      size: a.size,
+      tries,
+    } satisfies AttRetryWork);
+  }
+
   private async copyAttachments(ctx: MigrationContext, att: AttachmentResume): Promise<void> {
     const { store, source, dest, report } = ctx;
 
     while (att.upload || att.remaining.length > 0) {
       if (att.upload) {
         const up = att.upload;
-        const range = nextChunkRange(up.offset, up.size);
+        // Outlook upload sessions cap chunks at 4 MB (OneDrive allows more).
+        const range = nextChunkRange(up.offset, up.size, MAIL_ATTACHMENT_CHUNK_SIZE);
         if (!range) {
           att.upload = undefined;
           store.setState(W, 'att', att);
           continue;
         }
-        const res = await source.requestRaw(
-          'GET',
-          `${ctx.sourceUserPath}/messages/${att.srcMsgId}/attachments/${up.attId}/$value`,
-          { headers: { range: `bytes=${range.start}-${range.end}` } }
-        );
-        const bytes = await res.arrayBuffer();
-        const result = await putUploadChunk(up.sessionUrl, bytes, range.start, range.end, up.size);
-        up.offset = range.end + 1;
-        report.bytes(W, range.length);
-        if (result.done || up.offset >= up.size) att.upload = undefined;
-        store.setState(W, 'att', att);
+        try {
+          const res = await source.requestRaw(
+            'GET',
+            `${ctx.sourceUserPath}/messages/${att.srcMsgId}/attachments/${up.attId}/$value`,
+            { headers: { range: `bytes=${range.start}-${range.end}` } }
+          );
+          let bytes = await res.arrayBuffer();
+          if (res.status === 200 && bytes.byteLength > range.length) {
+            // source ignored the Range header and returned the full content
+            bytes = bytes.slice(range.start, range.end + 1);
+          }
+          const result = await putUploadChunk(up.sessionUrl, bytes, range.start, range.end, up.size);
+          up.offset = range.end + 1;
+          report.bytes(W, range.length);
+          if (result.done || up.offset >= up.size) att.upload = undefined;
+          store.setState(W, 'att', att);
+        } catch (e) {
+          if (!(e instanceof GraphError) || e.name === 'GraphThrottleError') throw e;
+          this.queueAttachmentRetry(
+            ctx,
+            att,
+            { id: up.attId, name: up.name, size: up.size },
+            e.code,
+            e.message
+          );
+          att.upload = undefined;
+          store.setState(W, 'att', att);
+        }
         continue;
       }
 
@@ -419,13 +556,7 @@ export class MailEngine implements WorkloadEngine {
         store.setState(W, 'att', att);
       } catch (e) {
         if (e instanceof GraphError && e.name !== 'GraphThrottleError') {
-          report.itemError(W, {
-            itemType: 'attachment',
-            itemId: next.id,
-            itemName: next.name,
-            code: e.code,
-            message: e.message,
-          });
+          this.queueAttachmentRetry(ctx, att, next, e.code, e.message);
           att.upload = undefined;
           att.remaining.shift();
           store.setState(W, 'att', att);

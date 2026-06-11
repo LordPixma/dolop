@@ -66,6 +66,12 @@ export function toCsv(headers: string[], rows: unknown[][]): string {
  */
 export const UPLOAD_CHUNK_SIZE = 32 * 320 * 1024; // 10,485,760 bytes
 
+/**
+ * Outlook attachment upload sessions reject chunks over 4 MB (unlike OneDrive).
+ * 12 × 320 KiB stays 320 KiB-aligned and safely under the limit.
+ */
+export const MAIL_ATTACHMENT_CHUNK_SIZE = 12 * 320 * 1024; // 3,932,160 bytes
+
 export function nextChunkRange(offset: number, total: number, chunkSize = UPLOAD_CHUNK_SIZE): { start: number; end: number; length: number } | null {
   if (offset >= total) return null;
   const start = offset;

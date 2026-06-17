@@ -27,6 +27,10 @@ A practical sequence for moving an acquired organisation from tenant A (source) 
 7. Watch the Users tab; triage the Errors tab. Item errors don't stop a mailbox — fix root
    causes (permissions, licensing) and they'll be retried by the next pass.
 8. Optionally enable **automatic delta sync** in Settings to keep tenants converged.
+9. Optionally turn on **coexistence** (Coexistence tab → direction *Source → Destination* →
+   *Enable all*) so destination mailboxes receive live mail while users still work in the
+   source. If forwarded copies don't appear, allow external auto-forwarding on the source
+   tenant's outbound spam policy — see [coexistence.md](coexistence.md).
 
 ## Cutover weekend
 
@@ -36,14 +40,21 @@ A practical sequence for moving an acquired organisation from tenant A (source) 
     (If the SMTP domain itself moves tenants, remove it from the source tenant and attach it
     to the destination, then update UPNs/proxy addresses — plan this carefully; it is the one
     genuinely disruptive step in any tenant-to-tenant migration.)
-11. **Final delta pass** after mail flow switches, catching anything delivered during the
+11. **Flip coexistence** (if enabled): on the Coexistence tab change the direction to
+    *Destination → Source* and *Enable all* — now that mail lands in the destination, copies
+    flow back to anyone still using the source. Dolop tears down the old forwarding rule
+    automatically.
+13. **Final delta pass** after mail flow switches, catching anything delivered during the
     change window. Run Rules & settings last so auto-replies/rules land after mailboxes are
     complete.
-12. **Reports**: download the user + error CSVs (also archived in R2) for the project record.
+14. **Reports**: download the user + error CSVs (also archived in R2) for the project record.
 
 ## Aftercare
 
 - Keep auto-delta on for a few days for stragglers, then disable it and archive the project.
+- Leave **coexistence** running (now Destination → Source) while a handful of people still rely
+  on the old tenant; on the Coexistence tab click **Disable all** once you're confident the
+  source tenant can be retired.
 - Reconfigure Outlook/OneDrive clients (the equivalent of BitTitan DeploymentPro) with
   Intune/Autopilot or documented manual steps — see
   [bittitan-parity.md](bittitan-parity.md) for what client-side work remains.

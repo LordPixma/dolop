@@ -27,6 +27,7 @@ with delta passes, then cut over with minimal user disruption.
 | **Tasks** | Microsoft To Do lists, tasks, checklist items, recurrence |
 | **OneDrive** | Full drive via delta enumeration, folder structure, timestamps; files of any size streamed in 10 MiB chunks (never buffered whole); changed files re-copied on delta passes via cTag comparison |
 | **Rules & settings** | Inbox rules (folder ids remapped), Outlook master categories, mailbox settings (auto-reply, time zone, working hours, locale) |
+| **Coexistence** | Mail dual-delivery: a managed forwarding rule keeps both mailboxes fed so mail to one address is received in both tenants — one direction at a time (no loops), flipped at cutover, off when you retire the other tenant |
 | **Provisioning** | Create destination accounts in bulk with one-time passwords and license assignment (SKU picker) |
 | **Assessment** | Pre-migration sizing (mailbox item counts, OneDrive usage) and destination readiness checks — writes nothing |
 | **Tenant onboarding** | BitTitan-style **admin consent links**: one multi-tenant app, a Global Admin clicks approve, the connector binds itself — or manual per-tenant app registrations if preferred |
@@ -37,6 +38,8 @@ with delta passes, then cut over with minimal user disruption.
 - Pass types: **pre-stage** (mail older than a cutoff), **full** (everything, idempotent),
   **delta** (only changes since the last pass), **assessment** (read-only sizing)
 - **Auto-delta**: cron-scheduled sync keeps tenants converged until cutover day
+- **Coexistence**: optional mail dual-delivery so both mailboxes receive live mail during the
+  overlap window — flip its direction at cutover, switch it off when the other tenant retires
 - **Live dashboard**: real progress denominators (mailbox folder counts, OneDrive quota),
   per-workload bars, per-mailbox activity, items/min and data/min throughput
 - **Item-level error reporting**: failures never stop a mailbox; they're logged per item and
@@ -115,6 +118,7 @@ migrations, ensures queues exist, and syncs optional `DOLOP_*` secrets).
 | --- | --- |
 | [Setup guide](docs/setup.md) | Entra app registrations (consent-link & manual modes), permissions, Cloudflare provisioning |
 | [M&A runbook](docs/runbook.md) | Step-by-step cutover playbook, from assessment to aftercare |
+| [Coexistence](docs/coexistence.md) | Mail dual-delivery during the overlap window: how forwarding works, direction at cutover, the external-forwarding caveat |
 | [Architecture](docs/architecture.md) | Engine internals, tick budgets, idempotency model, security |
 | [FAQ](docs/faq.md) | Costs, speed, data handling, comparisons, troubleshooting |
 | [Parity & limitations](docs/bittitan-parity.md) | Honest feature matrix vs commercial tools — read before cutover |

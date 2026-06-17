@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
+  COEXISTENCE_RULE_NAME,
+  buildCoexistenceRule,
   buildContactPayload,
   buildEventPayload,
   buildMessagePayload,
@@ -99,6 +101,22 @@ describe('buildRulePayload', () => {
       () => undefined
     );
     expect(p).not.toBeNull();
+  });
+});
+
+describe('buildCoexistenceRule', () => {
+  it('forwards a copy of all mail to the counterpart address', () => {
+    const r = buildCoexistenceRule('ada@target.onmicrosoft.com');
+    expect(r.displayName).toBe(COEXISTENCE_RULE_NAME);
+    expect(r.isEnabled).toBe(true);
+    // No conditions → applies to every incoming message.
+    expect(r.conditions).toEqual({});
+    const actions = r.actions as Record<string, unknown>;
+    expect(actions.forwardTo).toEqual([
+      { emailAddress: { address: 'ada@target.onmicrosoft.com' } },
+    ]);
+    // forwardTo keeps the original in the mailbox; other rules still run.
+    expect(actions.stopProcessingRules).toBe(false);
   });
 });
 

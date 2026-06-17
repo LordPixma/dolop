@@ -547,6 +547,7 @@ async function renderProject(projectId, tab) {
     content.id = 'tab-content';
     if (tab === 'users') await tabUsers(content, project);
     else if (tab === 'migrate') await tabMigrate(content, project);
+    else if (tab === 'coexistence') await tabCoexistence(content, project);
     else if (tab === 'errors') await tabErrors(content, project);
     else if (tab === 'events') await tabEvents(content, project);
     else await tabSettings(content, project, data);
@@ -556,7 +557,7 @@ async function renderProject(projectId, tab) {
     const prevSelAll = document.getElementById('sel-all')?.checked ?? false;
     const scrollY = window.scrollY;
 
-    const tabs = ['users', 'migrate', 'errors', 'events', 'settings'];
+    const tabs = ['users', 'migrate', 'coexistence', 'errors', 'events', 'settings'];
     $app.innerHTML = `
       <div class="page-head">
         <div>
@@ -1066,6 +1067,112 @@ function startPassModal(project, userIds) {
       closeModal(); toast(`${res.queued} user(s) queued for ${passType} pass`, 'ok');
       viewProject(project.id, 'users');
     } catch (e) { toast(e.message, 'error'); }
+  });
+}
+
+// -- Coexistence tab ----------------------------------------------------------
+
+const COEX_DIR_LABELS = {
+  src_to_dest: 'Source → Destination',
+  dest_to_src: 'Destination → Source',
+};
+
+async function tabCoexistence(c, project) {
+  const [{ summary }, { users }] = await Promise.all([
+    api('GET', `/api/projects/${project.id}/coexistence`),
+    api('GET', `/api/projects/${project.id}/users?limit=500`),
+  ]);
+  const dirLabel = (d) => COEX_DIR_LABELS[d] || '—';
+
+  const rows = users.map((u) => `
+    <tr>
+      <td class="checkbox-col"><input type="checkbox" data-sel="${u.id}" /></td>
+      <td><strong>${esc(u.sourceUpn)}</strong></td>
+      <td class="mono">${esc(u.destUpn)}</td>
+      <td>${pill(u.coexistenceStatus || 'off')}</td>
+      <td class="muted" style="font-size:.8rem">${esc(dirLabel(u.coexistenceDirection))}</td>
+      <td class="mono" style="font-size:.78rem">${esc(u.coexistenceForwardAddress || '')}</td>
+      <td class="muted" style="font-size:.76rem">${esc((u.coexistenceDetail || '').slice(0, 120))}</td>
+    </tr>`).join('');
+
+  c.innerHTML = `
+    <div class="card">
+      <h3>Mail coexistence (dual-delivery)</h3>
+      <p class="sub">Forward a copy of incoming mail to each user's mailbox in the other tenant, so messages sent to one address are received in both — during pre-stage, through cutover, and into aftercare. Only one direction is active per user at a time, which prevents forwarding loops.</p>
+      <div class="statrow">
+        <div class="stat"><div class="n" style="color:var(--green)">${summary.active}</div><div class="l">active</div></div>
+        <div class="stat"><div class="n">${summary.off}</div><div class="l">off</div></div>
+        <div class="stat"><div class="n" style="color:${summary.failed ? 'var(--red)' : 'inherit'}">${summary.failed}</div><div class="l">failed</div></div>
+        <div class="stat"><div class="n" style="font-size:1rem">${esc(dirLabel(summary.direction))}</div><div class="l">active direction</div></div>
+      </div>
+      <div class="formgrid" style="margin-top:.7rem">
+        <div>
+          <label>Direction</label>
+          <select id="cx-dir">
+            <option value="src_to_dest">Source → Destination (before cutover — MX on source)</option>
+            <option value="dest_to_src">Destination → Source (after cutover — MX moved to destination)</option>
+          </select>
+        </div>
+        <div>
+          <label>Forward to</label>
+          <select id="cx-mode">
+            <option value="routing">onmicrosoft routing address (recommended)</option>
+            <option value="upn">Mapped UPN</option>
+          </select>
+        </div>
+      </div>
+      <div class="btnrow" style="margin-top:.9rem">
+        <button class="primary" id="cx-enable-sel">Enable selected</button>
+        <button id="cx-enable-all">Enable all</button>
+        <button id="cx-disable-sel">Disable selected</button>
+        <button class="danger" id="cx-disable-all">Disable all</button>
+      </div>
+      <div class="muted" style="font-size:.8rem;margin-top:.7rem">
+        At cutover, change the direction and click <strong>Enable all</strong> again — Dolop removes the old forwarding rule and builds the reverse one. When you're confident the other tenant can be retired, <strong>Disable all</strong>.
+        Note: forwarding to another tenant counts as <em>external</em> auto-forwarding; if copies don't arrive, allow it in the forwarding tenant's outbound anti-spam policy.
+      </div>
+    </div>
+    <div class="card">
+      ${users.length ? `<table><thead><tr><th class="checkbox-col"><input type="checkbox" id="sel-all" /></th><th>Source</th><th>Destination</th><th>Coexistence</th><th>Direction</th><th>Forwards to</th><th>Detail</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">No users in scope yet. Add users on the Users tab first.</div>'}
+    </div>`;
+
+  if (summary.direction) c.querySelector('#cx-dir').value = summary.direction;
+
+  const selAll = c.querySelector('#sel-all');
+  if (selAll) selAll.addEventListener('change', () => {
+    c.querySelectorAll('[data-sel]').forEach((x) => { x.checked = selAll.checked; });
+  });
+
+  const selected = () => [...c.querySelectorAll('[data-sel]:checked')].map((x) => x.dataset.sel);
+  const chunk = (arr, n) => { const o = []; for (let i = 0; i < arr.length; i += n) o.push(arr.slice(i, i + n)); return o; };
+
+  async function run(action, ids) {
+    if (!ids.length) return toast('No matching users', 'error');
+    const dir = c.querySelector('#cx-dir').value;
+    const mode = c.querySelector('#cx-mode').value;
+    let ok = 0; let fail = 0;
+    try {
+      for (const batch of chunk(ids, 50)) {
+        const body = action === 'enable'
+          ? { userIds: batch, direction: dir, forwardMode: mode }
+          : { userIds: batch };
+        const res = await api('POST', `/api/projects/${project.id}/coexistence/${action}`, body);
+        for (const r of res.results) { if (r.status === 'failed') fail++; else ok++; }
+      }
+      toast(`${action === 'enable' ? 'Enabled' : 'Disabled'} ${ok} user(s)${fail ? `, ${fail} failed` : ''}`, fail ? 'error' : 'ok');
+      viewProject(project.id, 'coexistence');
+    } catch (e) { toast(e.message, 'error'); }
+  }
+
+  const allIds = users.map((u) => u.id);
+  const eligibleOff = users.filter((u) => (u.coexistenceStatus && u.coexistenceStatus !== 'off')).map((u) => u.id);
+  c.querySelector('#cx-enable-sel').addEventListener('click', () => run('enable', selected()));
+  c.querySelector('#cx-enable-all').addEventListener('click', () => {
+    if (confirm(`Enable coexistence forwarding for all ${allIds.length} user(s) in the chosen direction?`)) run('enable', allIds);
+  });
+  c.querySelector('#cx-disable-sel').addEventListener('click', () => run('disable', selected()));
+  c.querySelector('#cx-disable-all').addEventListener('click', () => {
+    if (confirm('Remove the coexistence forwarding rule from every user?')) run('disable', eligibleOff.length ? eligibleOff : allIds);
   });
 }
 

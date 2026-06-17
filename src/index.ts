@@ -3,6 +3,7 @@
 
 import { Hono } from 'hono';
 import { authApi } from './api/auth';
+import { coexistenceApi } from './api/coexistence';
 import { connectorsApi } from './api/connectors';
 import { ApiError } from './api/helpers';
 import { migrationsApi } from './api/migrations';
@@ -100,6 +101,7 @@ app.route('/api/connectors', connectorsApi);
 app.route('/api/projects', projectsApi);
 app.route('/api/projects', usersApi);
 app.route('/api/projects', migrationsApi);
+app.route('/api/projects', coexistenceApi);
 app.route('/api/projects', reportsApi);
 
 app.onError((err, c) => {

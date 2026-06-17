@@ -20,6 +20,7 @@ M365 moves, and where the honest gaps are.
 | Assessment / sizing | ✅ mailbox item counts, OneDrive bytes, destination readiness checks |
 | Reporting | ✅ CSV user + error reports, archived to R2 |
 | Inbox rules, auto-replies, mailbox settings, categories | ✅ (BitTitan needs the DMA agent for some of this; dolop does it server-side via Graph) |
+| Mail coexistence (dual-delivery) | ✅ via a managed forwarding inbox rule — one direction at a time, flipped at cutover; see [coexistence.md](coexistence.md) and the caveats below |
 
 ## Caveats and gaps (read before promising users anything)
 
@@ -32,6 +33,8 @@ M365 moves, and where the honest gaps are.
 | **Item attachments** (emails attached to emails) | ⚠️ | Copied without full fidelity; each is logged as an item error for review. |
 | Mailbox **permissions/delegates**, shared-mailbox ACLs | ❌ | Re-grant in the destination (Exchange admin / PowerShell). Shared mailboxes themselves migrate fine — add them as users in scope. |
 | Distribution lists, M365 Groups, Teams | ❌ | Outside the *user* bundle scope; use directory tooling. |
+| **Calendar free/busy & directory (GAL) coexistence** | ❌ out of scope | Cross-tenant free/busy and GAL sync need Exchange organisation relationships / cross-tenant config, not reachable app-only via Graph. Dolop's [coexistence](coexistence.md) covers **mail dual-delivery** only. |
+| External auto-forwarding for coexistence | ⚠️ | Forwarding between tenants is *external* auto-forwarding, blocked by the default outbound spam policy. Allow it on the forwarding tenant (`Set-HostedOutboundSpamFilterPolicy -AutoForwardingMode On`) or copies won't be delivered. |
 | Contact photos, S/MIME certificates | ❌ | Not migrated. |
 | Domain move (UPN/SMTP domain transfer between tenants) | ➖ | Inherently a Microsoft-side DNS/Entra operation in any tool; see the runbook cutover section. |
 

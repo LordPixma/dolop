@@ -8,6 +8,8 @@
   one address is received in both. One direction is active per user at a time (no loops),
   flipped at cutover and switched off when the other tenant is retired. New Coexistence tab,
   `/api/projects/:id/coexistence[/enable|/disable]` endpoints, and [docs/coexistence.md](docs/coexistence.md).
+- Coexistence visibility: per-user coexistence status now shows as a column on the Users tab
+  and is included in the user CSV report (status, direction, forward address).
 
 ## 0.1.0 — 2026-06-10
 

@@ -5,7 +5,7 @@
 
 import { GraphError } from '../graph/client';
 import type { MailboxSettings, MessageRule, OutlookCategory } from '../graph/types';
-import { buildRulePayload } from './transform';
+import { COEXISTENCE_RULE_NAME, buildRulePayload } from './transform';
 import type { MigrationContext, StepResult, WorkloadEngine } from './workload';
 
 const W = 'rules';
@@ -72,6 +72,10 @@ export class RulesEngine implements WorkloadEngine {
     ]);
     const existing = new Set(dstRules.map((r) => (r.displayName ?? '').toLowerCase()));
     for (const rule of srcRules) {
+      // The managed coexistence forwarding rule is mailbox-specific and must
+      // never be copied to the other tenant (it would forward to the wrong
+      // address and could form a loop). Leave it where it was applied.
+      if (rule.displayName === COEXISTENCE_RULE_NAME) continue;
       report.stat(W, 'discovered');
       if (rule.displayName && existing.has(rule.displayName.toLowerCase())) {
         report.stat(W, 'skipped');

@@ -86,6 +86,20 @@ export type UserStatus =
   | 'failed'
   | 'stopped';
 
+/**
+ * Mail coexistence direction. The "primary" side (the one that currently owns
+ * inbound mail flow / MX) forwards a copy to the counterpart mailbox:
+ * - 'src_to_dest': source mailbox forwards to destination (use before cutover).
+ * - 'dest_to_src': destination mailbox forwards to source (use after cutover).
+ * Only one direction is ever active per user, which prevents forwarding loops.
+ */
+export type CoexistenceDirection = 'src_to_dest' | 'dest_to_src';
+
+export type CoexistenceStatus = 'off' | 'active' | 'failed';
+
+/** How the forward target address is chosen for coexistence. */
+export type CoexistenceForwardMode = 'routing' | 'upn';
+
 export interface WorkloadStats {
   discovered: number;
   migrated: number;
@@ -160,6 +174,15 @@ export interface MigrationUser {
   heartbeatAt?: string;
   startedAt?: string;
   completedAt?: string;
+  /** Mail coexistence (dual-delivery) state for this user. */
+  coexistenceStatus: CoexistenceStatus;
+  coexistenceDirection?: CoexistenceDirection;
+  /** Graph messageRule id of the managed forwarding rule, for clean teardown. */
+  coexistenceRuleId?: string;
+  /** Address the managed rule forwards to (the counterpart mailbox). */
+  coexistenceForwardAddress?: string;
+  coexistenceDetail?: string;
+  coexistenceUpdatedAt?: string;
   createdAt: string;
   updatedAt: string;
 }

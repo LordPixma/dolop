@@ -96,6 +96,8 @@ tr.clickable:hover td { background: var(--bg3); }
 .pill.failed { background: rgba(248, 81, 73, 0.16); color: var(--red); }
 .pill.stopped { background: #30363d; color: var(--muted); }
 .pill.ok { background: rgba(63, 185, 80, 0.16); color: var(--green); }
+.pill.active { background: rgba(63, 185, 80, 0.16); color: var(--green); }
+.pill.off { background: #30363d; color: var(--muted); }
 .pill.unverified { background: #30363d; color: var(--muted); }
 .pill.pending_consent { background: rgba(210, 153, 34, 0.18); color: var(--yellow); }
 .pill.mode { background: rgba(88, 166, 255, 0.12); color: var(--accent2); font-weight: 500; }

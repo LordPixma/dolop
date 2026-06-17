@@ -152,6 +152,34 @@ export function buildTaskPayload(t: TodoTask): Record<string, unknown> {
 }
 
 /**
+ * Display name of the managed coexistence forwarding rule. Kept distinct so it
+ * can be found for update/teardown and skipped by the rules-migration engine
+ * (it must never be copied between mailboxes, or the copy would forward to the
+ * wrong tenant and risk a loop).
+ */
+export const COEXISTENCE_RULE_NAME = 'Dolop Coexistence (do not delete)';
+
+/**
+ * Build the managed inbox rule that forwards a copy of all incoming mail to the
+ * counterpart mailbox. `forwardTo` keeps the original in this mailbox and sends
+ * a copy onward, so mail is received in both tenants. The rule applies to every
+ * message (no conditions) and does not stop other rules from running.
+ */
+export function buildCoexistenceRule(forwardAddress: string): Record<string, unknown> {
+  return {
+    displayName: COEXISTENCE_RULE_NAME,
+    sequence: 1,
+    isEnabled: true,
+    conditions: {},
+    exceptions: {},
+    actions: {
+      forwardTo: [{ emailAddress: { address: forwardAddress } }],
+      stopProcessingRules: false,
+    },
+  };
+}
+
+/**
  * Rewrite folder-id references in an inbox rule using the mail folder map.
  * Returns null when the rule references a folder that was not migrated
  * (the rule cannot be recreated faithfully).

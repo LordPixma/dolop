@@ -8,6 +8,8 @@ export interface GraphUser {
   accountEnabled?: boolean;
   assignedLicenses?: { skuId: string }[];
   usageLocation?: string;
+  /** SMTP/other proxy addresses (e.g. "SMTP:user@tenant.onmicrosoft.com"). */
+  proxyAddresses?: string[];
 }
 
 export interface MailFolder {

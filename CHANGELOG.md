@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Mail coexistence (dual-delivery)**: optionally keep both tenants' mailboxes fed during the
+  migration overlap window. Dolop manages a single forwarding inbox rule per mailbox that
+  forwards a copy of incoming mail to the user's counterpart in the other tenant, so mail to
+  one address is received in both. One direction is active per user at a time (no loops),
+  flipped at cutover and switched off when the other tenant is retired. New Coexistence tab,
+  `/api/projects/:id/coexistence[/enable|/disable]` endpoints, and [docs/coexistence.md](docs/coexistence.md).
+
 ## 0.1.0 — 2026-06-10
 
 First public release.

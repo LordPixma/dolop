@@ -279,6 +279,12 @@ interface UserRow {
   heartbeat_at: string | null;
   started_at: string | null;
   completed_at: string | null;
+  coexistence_status: string | null;
+  coexistence_direction: string | null;
+  coexistence_rule_id: string | null;
+  coexistence_forward_address: string | null;
+  coexistence_detail: string | null;
+  coexistence_updated_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -301,6 +307,12 @@ function rowToUser(r: UserRow): MigrationUser {
     heartbeatAt: r.heartbeat_at ?? undefined,
     startedAt: r.started_at ?? undefined,
     completedAt: r.completed_at ?? undefined,
+    coexistenceStatus: (r.coexistence_status as MigrationUser['coexistenceStatus']) ?? 'off',
+    coexistenceDirection: (r.coexistence_direction ?? undefined) as MigrationUser['coexistenceDirection'],
+    coexistenceRuleId: r.coexistence_rule_id ?? undefined,
+    coexistenceForwardAddress: r.coexistence_forward_address ?? undefined,
+    coexistenceDetail: r.coexistence_detail ?? undefined,
+    coexistenceUpdatedAt: r.coexistence_updated_at ?? undefined,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -511,6 +523,61 @@ export async function projectUserSummary(
   const out: Record<string, number> = {};
   for (const r of results) out[r.status] = r.n;
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Mail coexistence
+
+export async function updateUserCoexistence(
+  db: D1Database,
+  userId: string,
+  patch: {
+    status: 'off' | 'active' | 'failed';
+    direction?: string | null;
+    ruleId?: string | null;
+    forwardAddress?: string | null;
+    detail?: string | null;
+  }
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE migration_users SET coexistence_status = ?, coexistence_direction = ?,
+       coexistence_rule_id = ?, coexistence_forward_address = ?, coexistence_detail = ?,
+       coexistence_updated_at = ?, updated_at = ? WHERE id = ?`
+    )
+    .bind(
+      patch.status,
+      patch.direction ?? null,
+      patch.ruleId ?? null,
+      patch.forwardAddress ?? null,
+      patch.detail ? patch.detail.slice(0, 2000) : null,
+      nowIso(),
+      nowIso(),
+      userId
+    )
+    .run();
+}
+
+/** Coexistence rollup for a project: counts by status and the active direction. */
+export async function coexistenceSummary(
+  db: D1Database,
+  projectId: string
+): Promise<{ active: number; off: number; failed: number; total: number; direction: string | null }> {
+  const { results } = await db
+    .prepare(
+      `SELECT coexistence_status AS status, coexistence_direction AS direction, COUNT(*) AS n
+       FROM migration_users WHERE project_id = ? GROUP BY coexistence_status, coexistence_direction`
+    )
+    .bind(projectId)
+    .all<{ status: string | null; direction: string | null; n: number }>();
+  const summary = { active: 0, off: 0, failed: 0, total: 0, direction: null as string | null };
+  for (const r of results) {
+    const status = (r.status as 'off' | 'active' | 'failed') ?? 'off';
+    summary[status] = (summary[status] ?? 0) + r.n;
+    summary.total += r.n;
+    if (status === 'active' && r.direction) summary.direction = r.direction;
+  }
+  return summary;
 }
 
 // ---------------------------------------------------------------------------

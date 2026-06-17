@@ -43,6 +43,9 @@ reportsApi.get('/:projectId/report', async (c) => {
         'started_at',
         'completed_at',
         'error',
+        'coexistence',
+        'coexistence_direction',
+        'coexistence_forward_address',
         'stats_json',
       ],
       users.map((u) => {
@@ -61,6 +64,9 @@ reportsApi.get('/:projectId/report', async (c) => {
           u.startedAt ?? '',
           u.completedAt ?? '',
           u.error ?? '',
+          u.coexistenceStatus,
+          u.coexistenceDirection ?? '',
+          u.coexistenceForwardAddress ?? '',
           JSON.stringify(u.stats),
         ];
       })

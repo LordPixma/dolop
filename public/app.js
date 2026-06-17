@@ -625,6 +625,9 @@ async function tabUsers(c, project) {
         <td><strong>${esc(u.sourceUpn)}</strong><div class="muted" style="font-size:.76rem">${esc(u.displayName || '')}</div></td>
         <td class="mono">${esc(u.destUpn)}</td>
         <td>${pill(u.status)}</td>
+        <td>${u.coexistenceStatus && u.coexistenceStatus !== 'off'
+          ? `<span title="${esc(u.coexistenceForwardAddress || '')}">${pill(u.coexistenceStatus)}</span>`
+          : '<span class="muted">—</span>'}</td>
         <td>${progressBar(u)}${act ? `<div class="muted" style="font-size:.72rem;margin-top:.2rem">${esc(act)}</div>` : ''}</td>
         <td class="right mono">${t.migrated}/${denom}${t.failed ? ` <span style="color:var(--red)">(${t.failed}✗)</span>` : ''}</td>
         <td class="right mono">${fmtBytes(t.bytes)}</td>
@@ -639,7 +642,7 @@ async function tabUsers(c, project) {
       <button class="danger" id="u-remove">Remove selected</button>
     </div>
     <div class="card">
-      ${users.length ? `<table><thead><tr><th class="checkbox-col"><input type="checkbox" id="sel-all" /></th><th>Source</th><th>Destination</th><th>Status</th><th>Progress</th><th class="right">Items</th><th class="right">Data</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">No users in scope. Use “Discover &amp; add users” or import a CSV mapping.</div>'}
+      ${users.length ? `<table><thead><tr><th class="checkbox-col"><input type="checkbox" id="sel-all" /></th><th>Source</th><th>Destination</th><th>Status</th><th>Coex</th><th>Progress</th><th class="right">Items</th><th class="right">Data</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="empty">No users in scope. Use “Discover &amp; add users” or import a CSV mapping.</div>'}
       ${total > 100 ? `<div class="pager">
         <button class="small" id="pg-prev" ${offset === 0 ? 'disabled' : ''}>‹ Prev</button>
         <span>${offset + 1}–${Math.min(offset + 100, total)} of ${total}</span>

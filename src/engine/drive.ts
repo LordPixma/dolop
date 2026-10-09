@@ -31,6 +31,14 @@ interface UploadState extends FileWork {
   offset: number;
 }
 
+/** Where the delta cursor moves once the current page's files are all copied. */
+interface DeltaAdvance {
+  /** The page's nextLink or deltaLink (absent when the feed returned neither). */
+  cursor?: string;
+  /** This was the last page of the enumeration. */
+  last: boolean;
+}
+
 function relPathFromParentReference(path: string | undefined): string {
   if (!path) return '';
   const idx = path.indexOf('root:');
@@ -117,7 +125,19 @@ export class DriveEngine implements WorkloadEngine {
         await this.copyFile(ctx, srcDriveId, dstDriveId, work.id, work.payload);
         continue;
       }
-      // 3. Advance delta enumeration.
+      // 3. The page's files are all copied: only now move the persisted delta
+      //    cursor past it. Advancing on fetch would let a pass that stops
+      //    mid-page lose its queued files and in-flight upload for good —
+      //    resetPass() drops both but keeps cursors. Re-reading a page after
+      //    a stop is safe: files copied with an unchanged cTag are skipped.
+      const advance = store.getState<DeltaAdvance>(W, 'advance');
+      if (advance) {
+        if (advance.cursor) store.setCursor(W, 'delta', advance.cursor);
+        store.delState(W, 'advance');
+        if (advance.last) store.setState(W, 'enumDone', true);
+        continue;
+      }
+      // 4. Advance delta enumeration.
       if (store.getState<boolean>(W, 'enumDone')) return 'done';
       await this.fetchDeltaPage(ctx, srcDriveId);
     }
@@ -168,14 +188,10 @@ export class DriveEngine implements WorkloadEngine {
       } satisfies FileWork);
     }
 
-    if (page.deltaLink) {
-      store.setCursor(W, 'delta', page.deltaLink);
-      store.setState(W, 'enumDone', true);
-    } else if (page.nextLink) {
-      store.setCursor(W, 'delta', page.nextLink);
-    } else {
-      store.setState(W, 'enumDone', true);
-    }
+    store.setState(W, 'advance', {
+      cursor: page.deltaLink ?? page.nextLink,
+      last: Boolean(page.deltaLink) || !page.nextLink,
+    } satisfies DeltaAdvance);
   }
 
   /** Find-or-create the destination folder for a relative path; '' = root. */

@@ -33,9 +33,14 @@ at most one tick of repeated work.
 
 ### Engine state model (per-user DO SQLite)
 
-- `kv` — `phase:*` and `state:*` keys (reset every pass) plus `cursor:*` keys
+- `kv` — `phase:*` and `state:*` keys (reset every pass), `cursor:*` keys
   (**persist across passes**: mail per-folder delta links keyed by filter signature,
-  the OneDrive delta token).
+  the OneDrive delta token) and `carry:*` keys (in-flight work a stopped pass hands to
+  the next one, e.g. a message whose attachments are mid-copy).
+- **Cursor rule**: a persisted cursor only moves past a page once every item on that page
+  is handled, because a new pass discards whatever is still queued in pass state. A pass
+  stopped mid-page therefore re-reads that page next time, and the id map turns the
+  already-copied items into skips.
 - **Paged item workloads** (contacts, calendar, To Do) record their position *within* a
   page — page URL, items handled, last item id — after every item, so a tick that runs out
   of budget mid-page resumes at the next item. Id-map skips make no Graph call and don't

@@ -7,6 +7,12 @@
   vs. a 25-item budget), the rest of that page was never migrated and no error was logged.
   These workloads now resume mid-page. Items missed by earlier passes are picked up by the
   next pass of any type. Re-walking already-migrated items is also much faster.
+- **Fixed: a stopped or failed pass could lose mail and OneDrive work.** Delta cursors
+  advanced when a page was *fetched*, but a new pass discards whatever was still queued,
+  so messages on a partly-processed page, queued OneDrive files and an in-flight large
+  upload were skipped forever. Cursors now advance only once a page is fully handled, and
+  a message whose attachments were mid-copy is finished by the next pass instead of being
+  duplicated.
 
 - **Workspaces, sign-up and invites**: accounts, connectors and projects now belong to
   isolated workspaces (existing data moves into a default workspace — migration

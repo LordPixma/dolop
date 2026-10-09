@@ -4,6 +4,8 @@
 //   phase:<workload>            current phase within a workload (reset each pass)
 //   state:<workload>:<key>      transient pass state (reset each pass)
 //   cursor:<workload>:<key>     persistent cursors — delta links — survive passes
+//   carry:<workload>:<key>      in-flight work a stopped pass hands to the next
+//                               pass (e.g. a message whose attachments are mid-copy)
 //   sys:<key>                   orchestrator bookkeeping (current pass, indexes…)
 // The idmap table (source item id → destination item id) survives passes and is
 // what makes pre-stage → full → delta sequences idempotent.
@@ -90,6 +92,18 @@ export class EngineStore {
     this.delRaw(`cursor:${workload}:${key}`);
   }
 
+  getCarry<T>(workload: string, key: string): T | null {
+    return this.getJson<T>(`carry:${workload}:${key}`);
+  }
+
+  setCarry(workload: string, key: string, value: unknown): void {
+    this.setJson(`carry:${workload}:${key}`, value);
+  }
+
+  delCarry(workload: string, key: string): void {
+    this.delRaw(`carry:${workload}:${key}`);
+  }
+
   // -- id map ------------------------------------------------------------------
 
   mapGet(workload: string, kind: string, src: string): string | null {
@@ -167,7 +181,12 @@ export class EngineStore {
 
   // -- pass lifecycle ---------------------------------------------------------------
 
-  /** Clear per-pass state while keeping idmap + delta cursors (incremental sync). */
+  /**
+   * Clear per-pass state while keeping idmap, delta cursors and carried
+   * in-flight work (incremental sync). Engines must only advance a persisted
+   * cursor once the work it covers is done — anything still queued in pass
+   * state when a pass stops is discarded here.
+   */
   resetPass(): void {
     this.sql.exec(`DELETE FROM kv WHERE k LIKE 'phase:%' OR k LIKE 'state:%'`);
     // Queued attachment repairs survive into the next pass so they self-heal.

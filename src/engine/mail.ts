@@ -49,6 +49,15 @@ interface FolderCursor {
   isDelta: boolean;
 }
 
+/** Where a folder's cursor moves once the current page's messages are all handled. */
+interface PageAdvance {
+  srcFolderId: string;
+  /** The page's nextLink or deltaLink (absent when the feed returned neither). */
+  cursor?: FolderCursor;
+  /** This was the folder's last page. */
+  last: boolean;
+}
+
 interface AttachmentResume {
   srcMsgId: string;
   destMsgId: string;
@@ -229,13 +238,19 @@ export class MailEngine implements WorkloadEngine {
 
   private async items(ctx: MigrationContext): Promise<StepResult> {
     const { store } = ctx;
+    // One-time upgrade: in-flight attachment state used to be pass state.
+    const legacyAtt = store.getState<AttachmentResume>(W, 'att');
+    if (legacyAtt) {
+      store.setCarry(W, 'att', legacyAtt);
+      store.delState(W, 'att');
+    }
     while (!ctx.budget.exhausted) {
       // Resume an interrupted attachment copy before anything else.
-      const att = store.getState<AttachmentResume>(W, 'att');
+      const att = store.getCarry<AttachmentResume>(W, 'att');
       if (att) {
         await this.copyAttachments(ctx, att);
         if (att.retry) {
-          store.delState(W, 'att');
+          store.delCarry(W, 'att');
           if (att.workId !== undefined) store.popWork(att.workId);
           ctx.budget.itemDone();
         } else {
@@ -248,7 +263,7 @@ export class MailEngine implements WorkloadEngine {
       const retryWork = store.peekWork<AttRetryWork>(W, 'attretry');
       if (retryWork) {
         const r = retryWork.payload;
-        store.setState(W, 'att', {
+        store.setCarry(W, 'att', {
           srcMsgId: r.srcMsgId,
           destMsgId: r.destMsgId,
           remaining: [{ id: r.attId, name: r.name, size: r.size }],
@@ -262,7 +277,7 @@ export class MailEngine implements WorkloadEngine {
       const work = store.peekWork<ScanWork>(W, 'scan');
       if (!work) return 'done';
       const scan = work.payload;
-      const cursorKey = this.deltaCursorKey(scan.srcFolderId, ctx.pass.filters);
+      const cursorKey = `cursor:${W}:${this.deltaCursorKey(scan.srcFolderId, ctx.pass.filters)}`;
 
       const pending = store.getState<string[]>(W, 'pending') ?? [];
       if (pending.length > 0) {
@@ -270,34 +285,42 @@ export class MailEngine implements WorkloadEngine {
         continue;
       }
 
-      // Fetch the next delta page for this folder.
-      let cursor = store.getJson<FolderCursor>(`cursor:${W}:${cursorKey}`);
-      const folderDone = store.getState<boolean>(W, `pageDone:${scan.srcFolderId}`);
-      if (folderDone) {
-        store.delState(W, `pageDone:${scan.srcFolderId}`);
-        store.popWork(work.id);
+      // The page is fully handled: only now move the folder's persisted cursor
+      // past it. Advancing on fetch would let a pass that stops mid-page skip
+      // the page's remaining messages for good — resetPass() drops `pending`
+      // but keeps cursors. Re-reading a page after a stop is safe: the id map
+      // turns already-copied messages into skips.
+      const advance = store.getState<PageAdvance>(W, 'advance');
+      if (advance?.srcFolderId === scan.srcFolderId) {
+        if (advance.cursor) store.setJson(cursorKey, advance.cursor);
+        store.delState(W, 'advance');
+        if (advance.last) store.popWork(work.id);
         continue;
       }
+
+      // Fetch the next delta page for this folder.
+      const cursor = store.getJson<FolderCursor>(cursorKey);
       const url = cursor?.url ?? this.initialDeltaUrl(ctx, scan.srcFolderId);
       const page = await ctx.source.page<GraphMessage>(url, 40);
       const ids = page.items.filter((m) => !m['@removed']).map((m) => m.id);
       ctx.report.stat(W, 'discovered', ids.length);
       store.setState(W, 'pending', ids);
-      if (page.deltaLink) {
-        store.setJson(`cursor:${W}:${cursorKey}`, { url: page.deltaLink, isDelta: true } satisfies FolderCursor);
-        store.setState(W, `pageDone:${scan.srcFolderId}`, true);
-      } else if (page.nextLink) {
-        store.setJson(`cursor:${W}:${cursorKey}`, { url: page.nextLink, isDelta: false } satisfies FolderCursor);
-      } else {
-        store.setState(W, `pageDone:${scan.srcFolderId}`, true);
-      }
+      store.setState(W, 'advance', {
+        srcFolderId: scan.srcFolderId,
+        cursor: page.deltaLink
+          ? { url: page.deltaLink, isDelta: true }
+          : page.nextLink
+            ? { url: page.nextLink, isDelta: false }
+            : undefined,
+        last: Boolean(page.deltaLink) || !page.nextLink,
+      } satisfies PageAdvance);
     }
     return 'continue';
   }
 
   private finishMessage(ctx: MigrationContext, srcMsgId: string, destMsgId: string): void {
     ctx.store.mapPut(W, 'item', srcMsgId, destMsgId);
-    ctx.store.delState(W, 'att');
+    ctx.store.delCarry(W, 'att');
     const pending = ctx.store.getState<string[]>(W, 'pending') ?? [];
     if (pending[0] === srcMsgId) {
       pending.shift();
@@ -405,7 +428,7 @@ export class MailEngine implements WorkloadEngine {
           destMsgId: created.id,
           remaining: (list.value ?? []).map((a) => ({ id: a.id, name: a.name, size: a.size ?? 0 })),
         };
-        store.setState(W, 'att', att);
+        store.setCarry(W, 'att', att);
         await this.copyAttachments(ctx, att);
       }
       this.finishMessage(ctx, msgId, created.id);
@@ -419,7 +442,7 @@ export class MailEngine implements WorkloadEngine {
           message: e.message,
         });
         report.stat(W, 'failed');
-        store.delState(W, 'att');
+        store.delCarry(W, 'att');
         skip();
         return;
       }
@@ -474,7 +497,7 @@ export class MailEngine implements WorkloadEngine {
         const range = nextChunkRange(up.offset, up.size, MAIL_ATTACHMENT_CHUNK_SIZE);
         if (!range) {
           att.upload = undefined;
-          store.setState(W, 'att', att);
+          store.setCarry(W, 'att', att);
           continue;
         }
         try {
@@ -492,7 +515,7 @@ export class MailEngine implements WorkloadEngine {
           up.offset = range.end + 1;
           report.bytes(W, range.length);
           if (result.done || up.offset >= up.size) att.upload = undefined;
-          store.setState(W, 'att', att);
+          store.setCarry(W, 'att', att);
         } catch (e) {
           if (!(e instanceof GraphError) || e.name === 'GraphThrottleError') throw e;
           this.queueAttachmentRetry(
@@ -503,7 +526,7 @@ export class MailEngine implements WorkloadEngine {
             e.message
           );
           att.upload = undefined;
-          store.setState(W, 'att', att);
+          store.setCarry(W, 'att', att);
         }
         continue;
       }
@@ -524,7 +547,7 @@ export class MailEngine implements WorkloadEngine {
           );
           att.upload = { attId: next.id, sessionUrl: session.uploadUrl, offset: 0, size: next.size, name: next.name };
           att.remaining.shift();
-          store.setState(W, 'att', att);
+          store.setCarry(W, 'att', att);
           continue;
         }
         const full = await source.get<GraphAttachment>(
@@ -553,13 +576,13 @@ export class MailEngine implements WorkloadEngine {
           });
         }
         att.remaining.shift();
-        store.setState(W, 'att', att);
+        store.setCarry(W, 'att', att);
       } catch (e) {
         if (e instanceof GraphError && e.name !== 'GraphThrottleError') {
           this.queueAttachmentRetry(ctx, att, next, e.code, e.message);
           att.upload = undefined;
           att.remaining.shift();
-          store.setState(W, 'att', att);
+          store.setCarry(W, 'att', att);
           continue;
         }
         throw e;

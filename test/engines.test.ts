@@ -5,6 +5,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CalendarEngine } from '../src/engine/calendar';
 import { ContactsEngine } from '../src/engine/contacts';
+import { DriveEngine } from '../src/engine/drive';
+import { MailEngine } from '../src/engine/mail';
 import { resumeIndex } from '../src/engine/paged';
 import { TasksEngine } from '../src/engine/tasks';
 import type { PassConfig } from '../src/types';
@@ -149,5 +151,154 @@ describe('tasks engine', () => {
     await h.run(new TasksEngine());
     expectEachOnce(created, source.map((t) => t.title));
     expectEachOnce(checklist, source.flatMap((t) => t.checklistItems.map((c) => c.displayName)));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Delta engines: a pass that stops mid-page must not lose that page
+
+describe('mail engine', () => {
+  function mailbox(n: number, attachments: Record<string, number> = {}) {
+    const source = range(n).map((i) => ({
+      id: `m${i}`,
+      subject: `Message ${i}`,
+      receivedDateTime: '2026-01-01T00:00:00Z',
+      body: { contentType: 'text', content: 'hello' },
+      hasAttachments: (attachments[`m${i}`] ?? 0) > 0,
+    }));
+    const created: { id: string; subject: string; attachments: string[] }[] = [];
+    fake
+      .route('GET', /^\/users\/src\/mailFolders\/inbox$/, () =>
+        json({ id: 'f-src', displayName: 'Inbox', childFolderCount: 0, totalItemCount: n })
+      )
+      .route('GET', /^\/users\/dst\/mailFolders\/inbox$/, () => json({ id: 'f-dst', displayName: 'Inbox' }))
+      .route('GET', /^\/users\/src\/mailFolders$/, () =>
+        json({ value: [{ id: 'f-src', displayName: 'Inbox', childFolderCount: 0, totalItemCount: n }] })
+      )
+      .route('GET', /^\/users\/src\/mailFolders\/f-src\/messages\/delta$/, (req) =>
+        pageOf(source.map((m) => ({ id: m.id })), req, { delta: true })
+      )
+      .route('GET', /^\/users\/src\/messages\/([^/]+)\/attachments$/, (req) =>
+        json({
+          value: range(attachments[req.m[1]!] ?? 0).map((j) => ({ id: `${req.m[1]}-a${j}`, name: `file${j}.txt`, size: 5 })),
+        })
+      )
+      .route('GET', /^\/users\/src\/messages\/([^/]+)\/attachments\/([^/]+)$/, (req) =>
+        json({ '@odata.type': '#microsoft.graph.fileAttachment', id: req.m[2], name: `${req.m[2]}.txt`, contentBytes: 'aGVsbG8=' })
+      )
+      .route('GET', /^\/users\/src\/messages\/([^/]+)$/, (req) => json(source.find((m) => m.id === req.m[1])))
+      .route('POST', /^\/users\/dst\/mailFolders\/f-dst\/messages$/, (req) => {
+        const id = `dm${created.length}`;
+        created.push({ id, subject: req.body.subject, attachments: [] });
+        return json({ id }, 201);
+      })
+      .route('POST', /^\/users\/dst\/messages\/([^/]+)\/attachments$/, (req) => {
+        created.find((c) => c.id === req.m[1])!.attachments.push(req.body.name);
+        return json({ id: 'att' }, 201);
+      });
+    return { source, created };
+  }
+
+  it('does not lose the rest of a page when a pass stops mid-page', async () => {
+    const { source, created } = mailbox(100); // delta pages of 40, 25 messages per tick
+    const h = new EngineHarness(FULL);
+    await h.run(new MailEngine(), { until: () => created.length >= 50 }); // stopped inside page 2
+    h.newPass();
+    await h.run(new MailEngine());
+    expectEachOnce(created.map((c) => c.subject), source.map((m) => m.subject));
+  });
+
+  it('finishes a half-copied message on the next pass instead of duplicating it', async () => {
+    const { source, created } = mailbox(10, { m3: 2 });
+    fake.throttle('POST', /^\/users\/dst\/messages\/[^/]+\/attachments$/, { after: 1 }); // m3's second attachment
+    const h = new EngineHarness(FULL);
+    const engine = new MailEngine();
+    let outcome;
+    for (let i = 0; i < 20 && outcome !== 'throttled'; i++) outcome = await h.tick(engine);
+    expect(outcome).toBe('throttled');
+    // the pass is stopped here, then a new pass starts
+    h.newPass();
+    await h.run(engine);
+    expectEachOnce(created.map((c) => c.subject), source.map((m) => m.subject));
+    expect(created.find((c) => c.subject === 'Message 3')!.attachments.sort()).toEqual(['m3-a0.txt', 'm3-a1.txt']);
+  });
+});
+
+describe('drive engine', () => {
+  const MB = 1024 * 1024;
+
+  function oneDrive(files: { name: string; size: number }[]) {
+    const items = [
+      { id: 'root', root: {} },
+      ...files.map((f, i) => ({
+        id: `f${i}`,
+        name: f.name,
+        size: f.size,
+        file: {},
+        cTag: `ctag-${i}`,
+        parentReference: { path: '/drive/root:' },
+        '@microsoft.graph.downloadUrl': `https://download.test/f${i}`,
+      })),
+    ];
+    const uploaded: string[] = []; // completed destination files, by name
+    const sessions = new Map<string, { name: string; size: number; received: number }>();
+    fake
+      .route('GET', /^\/users\/src\/drive$/, () => json({ id: 'src-drive', quota: { used: 1 } }))
+      .route('GET', /^\/users\/dst\/drive$/, () => json({ id: 'dst-drive' }))
+      .route('GET', /^\/drives\/src-drive\/root\/delta$/, (req) => pageOf(items, req, { delta: true }))
+      .route('GET', /^\/drives\/dst-drive\/root$/, () => json({ id: 'droot' }))
+      .route('GET', /^download\.test\/(f\d+)$/, (req) => {
+        const [, start, end] = /bytes=(\d+)-(\d+)/.exec(req.headers.get('range') ?? '') ?? [];
+        return new Response(new Uint8Array(Number(end) - Number(start) + 1), { status: 206 });
+      })
+      .route('PUT', /^\/drives\/dst-drive\/items\/droot:\/([^/:]+):\/content$/, (req) => {
+        uploaded.push(decodeURIComponent(req.m[1]!));
+        return json({ id: `d-${req.m[1]}` }, 201);
+      })
+      .route('PATCH', /^\/drives\/dst-drive\/items\/[^/]+$/, () => json({}))
+      .route('POST', /^\/drives\/dst-drive\/items\/droot:\/([^/:]+):\/createUploadSession$/, (req) => {
+        const id = `s${sessions.size}`;
+        const file = files.find((f) => f.name === decodeURIComponent(req.m[1]!))!;
+        sessions.set(id, { name: file.name, size: file.size, received: 0 });
+        return json({ uploadUrl: `https://upload.test/${id}` });
+      })
+      .route('PUT', /^upload\.test\/(s\d+)$/, (req) => {
+        const s = sessions.get(req.m[1]!)!;
+        s.received += req.raw?.byteLength ?? 0;
+        if (s.received < s.size) return json({ nextExpectedRanges: [`${s.received}-`] }, 202);
+        uploaded.push(s.name);
+        return json({ id: `d-${s.name}` }, 201);
+      });
+    return { uploaded };
+  }
+
+  it('does not lose queued files when a pass stops mid-page', async () => {
+    const files = range(150).map((i) => ({ name: `file${i}.txt`, size: 10 }));
+    const { uploaded } = oneDrive(files); // delta pages of 100, 25 files per tick
+    const h = new EngineHarness(FULL);
+    await h.run(new DriveEngine(), { until: () => uploaded.length >= 40 });
+    h.newPass();
+    await h.run(new DriveEngine());
+    expectEachOnce(uploaded, files.map((f) => f.name));
+  });
+
+  it('re-copies a large file whose upload was interrupted by a stopped pass', async () => {
+    const files = [
+      { name: 'small.txt', size: 10 },
+      { name: 'big.bin', size: 25 * MB }, // three 10 MiB chunks
+    ];
+    const { uploaded } = oneDrive(files);
+    fake.throttle('PUT', /^upload\.test\/s0$/, { after: 1 }); // first chunk lands, second is throttled
+    const h = new EngineHarness(FULL);
+    const engine = new DriveEngine();
+    let outcome;
+    for (let i = 0; i < 10 && outcome !== 'throttled'; i++) outcome = await h.tick(engine);
+    expect(outcome).toBe('throttled');
+    expect(uploaded).toEqual(['small.txt']);
+    // the pass is stopped mid-upload, then a new pass starts
+    h.newPass();
+    await h.run(engine);
+    expect(uploaded.sort()).toEqual(['big.bin', 'small.txt']);
+    expect(h.errors).toEqual([]);
   });
 });

@@ -9,6 +9,7 @@
 
 import { GraphError } from '../graph/client';
 import type { GraphCalendar, GraphEvent } from '../graph/types';
+import { drainPages } from './paged';
 import { buildEventPayload } from './transform';
 import type { MigrationContext, StepResult, WorkloadEngine } from './workload';
 
@@ -16,12 +17,19 @@ const W = 'calendar';
 
 const EVENT_SELECT =
   '$select=id,subject,body,start,end,location,attendees,organizer,recurrence,isAllDay,isCancelled,' +
-  'sensitivity,showAs,importance,categories,reminderMinutesBeforeStart,isReminderOn,type';
+  'sensitivity,showAs,importance,categories,reminderMinutesBeforeStart,isReminderOn,type,' +
+  'originalStartTimeZone,originalEndTimeZone';
 
 interface ScanWork {
   srcCalId: string;
   destCalId: string;
   name: string;
+}
+
+/** A created event whose attendee extension is still to be written (e.g. paused by throttling). */
+interface ExtensionResume {
+  srcEventId: string;
+  destEventId: string;
 }
 
 export class CalendarEngine implements WorkloadEngine {
@@ -43,6 +51,9 @@ export class CalendarEngine implements WorkloadEngine {
     ]);
     const dstByName = new Map(dstCals.map((c) => [(c.name ?? '').toLowerCase(), c.id]));
 
+    // Scans are queued only once every calendar is resolved, so a throttle
+    // part-way through (which re-runs this phase) can't queue one twice.
+    const scans: ScanWork[] = [];
     for (const cal of srcCals) {
       let destId = store.mapGet(W, 'cal', cal.id);
       if (!destId) {
@@ -74,87 +85,127 @@ export class CalendarEngine implements WorkloadEngine {
         }
         store.mapPut(W, 'cal', cal.id, destId);
       }
-      store.pushWork(W, 'scan', { srcCalId: cal.id, destCalId: destId, name: cal.name ?? '' } satisfies ScanWork);
+      scans.push({ srcCalId: cal.id, destCalId: destId, name: cal.name ?? '' });
     }
+    for (const s of scans) store.pushWork(W, 'scan', s);
     store.setPhase(W, 'items');
     return 'continue';
   }
 
   private async items(ctx: MigrationContext): Promise<StepResult> {
-    const { store, source, dest, report } = ctx;
+    const { store } = ctx;
     while (!ctx.budget.exhausted) {
       const work = store.peekWork<ScanWork>(W, 'scan');
       if (!work) return 'done';
       const scan = work.payload;
-
-      const url =
-        store.getState<string>(W, `next:${scan.srcCalId}`) ??
-        `${ctx.sourceUserPath}/calendars/${scan.srcCalId}/events?${EVENT_SELECT}`;
-      const page = await source.page<GraphEvent>(url, 25);
-
-      for (const ev of page.items) {
-        if (ctx.budget.exhausted) break;
-        if (ev.isCancelled || ev.type === 'occurrence' || ev.type === 'exception') continue;
-        report.stat(W, 'discovered');
-        if (store.mapGet(W, 'item', ev.id)) {
-          report.stat(W, 'skipped');
-          ctx.budget.itemDone();
-          continue;
-        }
-        try {
-          const { payload, strippedAttendees } = buildEventPayload(ev, {
-            attendeeMode: ctx.pass.filters.calendarAttendees ?? 'strip',
-          });
-          const created = await dest.post<{ id: string }>(
-            `${ctx.destUserPath}/calendars/${scan.destCalId}/events`,
-            payload
-          );
-          if (strippedAttendees) {
-            await dest
-              .post(`${ctx.destUserPath}/events/${created.id}/extensions`, {
-                '@odata.type': 'microsoft.graph.openTypeExtension',
-                extensionName: 'com.dolop.migration',
-                originalAttendees: JSON.stringify(strippedAttendees).slice(0, 30_000),
-                originalOrganizer: JSON.stringify(ev.organizer ?? null),
-              })
-              .catch(() => {
-                report.itemError(W, {
-                  itemType: 'event-extension',
-                  itemId: ev.id,
-                  itemName: ev.subject,
-                  code: 'extension_failed',
-                  message: 'event migrated but original attendee list could not be stored',
-                });
-              });
-          }
-          store.mapPut(W, 'item', ev.id, created.id);
-          report.stat(W, 'migrated');
-          ctx.budget.itemDone();
-        } catch (e) {
-          if (e instanceof GraphError && e.name !== 'GraphThrottleError') {
-            report.itemError(W, {
-              itemType: 'event',
-              itemId: ev.id,
-              itemName: ev.subject,
-              code: e.code,
-              message: e.message,
-            });
-            report.stat(W, 'failed');
-            store.mapPut(W, 'item', ev.id, 'failed'); // don't retry forever within this pass
-            ctx.budget.itemDone();
-            continue;
-          }
-          throw e;
-        }
-      }
-
-      if (page.nextLink) {
-        store.setState(W, `next:${scan.srcCalId}`, page.nextLink);
-      } else {
-        store.delState(W, `next:${scan.srcCalId}`);
-        store.popWork(work.id);
-      }
+      const finished = await drainPages<GraphEvent>(
+        ctx,
+        W,
+        {
+          key: scan.srcCalId,
+          firstUrl: `${ctx.sourceUserPath}/calendars/${scan.srcCalId}/events?${EVENT_SELECT}`,
+          pageSize: 25,
+        },
+        (ev) => this.copyEvent(ctx, scan, ev)
+      );
+      if (finished) store.popWork(work.id);
     }
     return 'continue';
+  }
+
+  private async copyEvent(ctx: MigrationContext, scan: ScanWork, ev: GraphEvent): Promise<void> {
+    const { store, dest, report } = ctx;
+    if (ev.isCancelled || ev.type === 'occurrence' || ev.type === 'exception') return;
+    const resume = store.getCarry<ExtensionResume>(W, 'extension');
+    if (resume?.srcEventId === ev.id) {
+      const { strippedAttendees } = buildEventPayload(ev, { attendeeMode: 'strip' });
+      await this.writeAttendeeExtension(ctx, ev, resume.destEventId, strippedAttendees ?? []);
+      report.stat(W, 'migrated');
+      ctx.budget.itemDone();
+      return;
+    }
+    report.stat(W, 'discovered');
+    if (store.mapGet(W, 'item', ev.id)) {
+      report.stat(W, 'skipped'); // no Graph call, so it doesn't count against the tick's item budget
+      return;
+    }
+    try {
+      const { payload, strippedAttendees } = buildEventPayload(await this.inOriginalZone(ctx, ev), {
+        attendeeMode: ctx.pass.filters.calendarAttendees ?? 'strip',
+      });
+      const created = await dest.post<{ id: string }>(
+        `${ctx.destUserPath}/calendars/${scan.destCalId}/events`,
+        payload
+      );
+      // Mapped straight away so a throttle on the extension resumes this
+      // event (via the carried marker) instead of creating it again.
+      store.mapPut(W, 'item', ev.id, created.id);
+      if (strippedAttendees) {
+        store.setCarry(W, 'extension', { srcEventId: ev.id, destEventId: created.id } satisfies ExtensionResume);
+        await this.writeAttendeeExtension(ctx, ev, created.id, strippedAttendees);
+      }
+      report.stat(W, 'migrated');
+    } catch (e) {
+      if (!(e instanceof GraphError) || e.name === 'GraphThrottleError') throw e;
+      report.itemError(W, {
+        itemType: 'event',
+        itemId: ev.id,
+        itemName: ev.subject,
+        code: e.code,
+        message: e.message,
+      });
+      report.stat(W, 'failed'); // left unmapped, so the next pass retries it
+    }
+    ctx.budget.itemDone();
+  }
+
+  /**
+   * Graph returns start/end in UTC unless a zone is requested, and a series
+   * created in UTC keeps its UTC time — so after a DST change every
+   * occurrence would sit an hour off. Series masters (and all-day events)
+   * are re-read in the time zone they were created in and created in it.
+   * Single events are absolute times, so UTC is exact for them.
+   */
+  private async inOriginalZone(ctx: MigrationContext, ev: GraphEvent): Promise<GraphEvent> {
+    const zone = ev.originalStartTimeZone;
+    if (ev.type !== 'seriesMaster' && !ev.isAllDay) return ev;
+    if (!zone || zone.startsWith('tzone://') || /^(utc|coordinated universal time)$/i.test(zone)) return ev;
+    try {
+      const local = await ctx.source.get<Pick<GraphEvent, 'start' | 'end'>>(
+        `${ctx.sourceUserPath}/events/${ev.id}?$select=start,end`,
+        { prefer: `outlook.timezone="${zone}"` }
+      );
+      return local.start && local.end ? { ...ev, start: local.start, end: local.end } : ev;
+    } catch (e) {
+      if (!(e instanceof GraphError) || e.name === 'GraphThrottleError') throw e;
+      return ev; // zone not accepted: keep the exact UTC times
+    }
+  }
+
+  /** Preserve the stripped attendee list on the destination event; a throttle pauses and retries. */
+  private async writeAttendeeExtension(
+    ctx: MigrationContext,
+    ev: GraphEvent,
+    destEventId: string,
+    attendees: unknown[]
+  ): Promise<void> {
+    try {
+      await ctx.dest.post(`${ctx.destUserPath}/events/${destEventId}/extensions`, {
+        '@odata.type': 'microsoft.graph.openTypeExtension',
+        extensionName: 'com.dolop.migration',
+        originalAttendees: JSON.stringify(attendees).slice(0, 30_000),
+        originalOrganizer: JSON.stringify(ev.organizer ?? null),
+      });
+    } catch (e) {
+      if (!(e instanceof GraphError) || e.name === 'GraphThrottleError') throw e;
+      ctx.report.itemError(W, {
+        itemType: 'event-extension',
+        itemId: ev.id,
+        itemName: ev.subject,
+        code: e.code,
+        message: `event migrated but its original attendee list could not be stored: ${e.message}`,
+      });
+    }
+    ctx.store.delCarry(W, 'extension');
   }
 }

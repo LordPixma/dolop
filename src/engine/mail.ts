@@ -11,7 +11,7 @@
 // attachments (upload sessions for large ones). The id map makes every pass
 // idempotent.
 
-import { GraphError } from '../graph/client';
+import { GraphError, GraphThrottleError } from '../graph/client';
 import type { GraphAttachment, GraphMessage, MailFolder } from '../graph/types';
 import {
   isPathExcluded,
@@ -21,7 +21,7 @@ import {
   nextChunkRange,
 } from '../util';
 import { buildMessagePayload } from './transform';
-import { putUploadChunk } from './upload';
+import { putUploadChunk, readByteRange } from './upload';
 import type { MigrationContext, StepResult, WorkloadEngine } from './workload';
 
 const W = 'mail';
@@ -49,9 +49,20 @@ interface FolderCursor {
   isDelta: boolean;
 }
 
+/** Where a folder's cursor moves once the current page's messages are all handled. */
+interface PageAdvance {
+  srcFolderId: string;
+  /** The page's nextLink or deltaLink (absent when the feed returned neither). */
+  cursor?: FolderCursor;
+  /** This was the folder's last page. */
+  last: boolean;
+}
+
 interface AttachmentResume {
   srcMsgId: string;
   destMsgId: string;
+  /** The message exists in the destination but its attachments aren't listed yet. */
+  unlisted?: boolean;
   remaining: { id: string; name?: string; size: number }[];
   /** in-flight large attachment upload */
   upload?: { attId: string; sessionUrl: string; offset: number; size: number; name?: string };
@@ -59,6 +70,8 @@ interface AttachmentResume {
   retry?: boolean;
   workId?: number;
   tries?: number;
+  /** set when the message itself is being retried from the msgretry queue */
+  msgRetryWorkId?: number;
 }
 
 /** A failed attachment copy queued for replay on a later tick or pass. */
@@ -72,6 +85,50 @@ interface AttRetryWork {
 }
 
 const MAX_ATTACHMENT_TRIES = 3;
+
+/** Whether a message's receivedDateTime falls inside the pass's date cutoffs. */
+function inDateWindow(
+  received: string | undefined,
+  filters: { mailReceivedBefore?: string; mailReceivedAfter?: string }
+): boolean {
+  const at = received ? Date.parse(received) : NaN;
+  if (Number.isNaN(at)) return true; // undated: don't silently drop it
+  if (filters.mailReceivedBefore && at > Date.parse(filters.mailReceivedBefore)) return false;
+  if (filters.mailReceivedAfter && at < Date.parse(filters.mailReceivedAfter)) return false;
+  return true;
+}
+
+/** Graph's answer when a delta/skip token's server-side sync state is gone. */
+function isSyncStateLost(e: GraphError): boolean {
+  return e.status === 410 || /syncstate|resync/i.test(e.code);
+}
+
+/** Where a message is copied to. */
+interface MessageTarget {
+  destFolderId: string;
+  asDraft: boolean;
+}
+
+/** A message that failed to copy, retried in a later pass (queue survives pass resets). */
+interface MsgRetryWork extends MessageTarget {
+  srcMsgId: string;
+  /** Attempts so far. */
+  tries: number;
+  /** Pass in which the last attempt failed; retried only from the next one. */
+  pass: number;
+}
+
+const MAX_MESSAGE_TRIES = 3;
+
+/** How a message being copied is accounted for once it's handled. */
+interface MessageJob {
+  /** Earlier failed attempts (0 for a message from the delta feed). */
+  tries: number;
+  /** Set when replaying a msgretry work item. */
+  retryWorkId?: number;
+  /** Called when the message is handled without being copied (skipped or failed). */
+  done: () => void;
+}
 
 export class MailEngine implements WorkloadEngine {
   readonly name = 'mail';
@@ -126,6 +183,12 @@ export class MailEngine implements WorkloadEngine {
         : `${ctx.sourceUserPath}/mailFolders`;
       const children = await source.listAll<MailFolder>(`${listPath}?$top=200`);
 
+      // Follow-up work is queued only once every child is resolved: a throttle
+      // part-way through re-runs this enum item, which would otherwise queue
+      // the earlier children's scans (and count their items) a second time.
+      const enums: EnumWork[] = [];
+      const scans: ScanWork[] = [];
+      let expected = 0;
       for (const child of children) {
         const childPath = path ? `${path}/${child.displayName}` : child.displayName;
         const wellKnownName = srcWkById.get(child.id);
@@ -135,9 +198,12 @@ export class MailEngine implements WorkloadEngine {
           isPathExcluded(childPath, ctx.pass.filters.excludeFolders) ||
           (ctx.pass.filters.excludeDeletedItems !== false && wellKnownName === 'deleteditems') ||
           (ctx.pass.filters.excludeJunk !== false && wellKnownName === 'junkemail');
+        // Nor its subfolders: e.g. folders deleted into Deleted Items would
+        // otherwise be recreated at the top of the destination mailbox.
+        if (excluded) continue;
 
         let destId = store.mapGet(W, 'folder', child.id);
-        if (!destId && !excluded) {
+        if (!destId) {
           try {
             destId = await this.resolveDestFolder(ctx, child, wellKnownName, dstWk, destParentId);
             store.mapPut(W, 'folder', child.id, destId);
@@ -158,26 +224,21 @@ export class MailEngine implements WorkloadEngine {
           }
         }
         if (child.childFolderCount > 0) {
-          store.pushWork(W, 'enum', {
-            srcFolderId: child.id,
-            destParentId: destId,
-            path: childPath,
-          } satisfies EnumWork);
+          enums.push({ srcFolderId: child.id, destParentId: destId, path: childPath });
         }
-        if (!excluded && destId) {
-          store.pushWork(W, 'scan', {
-            srcFolderId: child.id,
-            destFolderId: destId,
-            path: childPath,
-            asDraft: wellKnownName === 'drafts',
-          } satisfies ScanWork);
-          // Folder item counts give progress bars a real denominator. Delta
-          // passes only see new items, so the full count would mislead there.
-          if (ctx.pass.passType !== 'delta') {
-            ctx.report.expected(W, child.totalItemCount);
-          }
-        }
+        scans.push({
+          srcFolderId: child.id,
+          destFolderId: destId,
+          path: childPath,
+          asDraft: wellKnownName === 'drafts',
+        });
+        // Folder item counts give progress bars a real denominator. Delta
+        // passes only see new items, so the full count would mislead there.
+        if (ctx.pass.passType !== 'delta') expected += child.totalItemCount;
       }
+      for (const e of enums) store.pushWork(W, 'enum', e);
+      for (const s of scans) store.pushWork(W, 'scan', s);
+      if (expected > 0) report.expected(W, expected);
       store.popWork(work.id);
     }
     return 'continue';
@@ -214,32 +275,34 @@ export class MailEngine implements WorkloadEngine {
     return `delta:${srcFolderId}:${filterSignature(filters)}`;
   }
 
+  /**
+   * Date cutoffs are applied to each page, not in the query: message delta
+   * only accepts `receivedDateTime ge|gt` (so the pre-stage `le` cutoff was
+   * rejected) and any `$filter` caps the whole delta at 5,000 messages.
+   */
   private initialDeltaUrl(ctx: MigrationContext, srcFolderId: string): string {
-    const filters: string[] = [];
-    if (ctx.pass.filters.mailReceivedBefore) {
-      filters.push(`receivedDateTime le ${ctx.pass.filters.mailReceivedBefore}`);
-    }
-    if (ctx.pass.filters.mailReceivedAfter) {
-      filters.push(`receivedDateTime ge ${ctx.pass.filters.mailReceivedAfter}`);
-    }
-    let url = `${ctx.sourceUserPath}/mailFolders/${srcFolderId}/messages/delta?$select=id,receivedDateTime`;
-    if (filters.length) url += `&$filter=${encodeURIComponent(filters.join(' and '))}`;
-    return url;
+    return `${ctx.sourceUserPath}/mailFolders/${srcFolderId}/messages/delta?$select=id,receivedDateTime`;
   }
 
   private async items(ctx: MigrationContext): Promise<StepResult> {
     const { store } = ctx;
+    // One-time upgrade: in-flight attachment state used to be pass state.
+    const legacyAtt = store.getState<AttachmentResume>(W, 'att');
+    if (legacyAtt) {
+      store.setCarry(W, 'att', legacyAtt);
+      store.delState(W, 'att');
+    }
     while (!ctx.budget.exhausted) {
       // Resume an interrupted attachment copy before anything else.
-      const att = store.getState<AttachmentResume>(W, 'att');
+      const att = store.getCarry<AttachmentResume>(W, 'att');
       if (att) {
         await this.copyAttachments(ctx, att);
         if (att.retry) {
-          store.delState(W, 'att');
+          store.delCarry(W, 'att');
           if (att.workId !== undefined) store.popWork(att.workId);
           ctx.budget.itemDone();
         } else {
-          this.finishMessage(ctx, att.srcMsgId, att.destMsgId);
+          this.finishMessage(ctx, att.srcMsgId, att.destMsgId, att.msgRetryWorkId);
         }
         continue;
       }
@@ -248,7 +311,7 @@ export class MailEngine implements WorkloadEngine {
       const retryWork = store.peekWork<AttRetryWork>(W, 'attretry');
       if (retryWork) {
         const r = retryWork.payload;
-        store.setState(W, 'att', {
+        store.setCarry(W, 'att', {
           srcMsgId: r.srcMsgId,
           destMsgId: r.destMsgId,
           remaining: [{ id: r.attId, name: r.name, size: r.size }],
@@ -259,63 +322,154 @@ export class MailEngine implements WorkloadEngine {
         continue;
       }
 
+      // Retry messages that failed in an earlier pass. Retries queued by this
+      // pass sit behind them (higher ids), so they wait for the next pass.
+      const msgRetry = store.peekWork<MsgRetryWork>(W, 'msgretry');
+      if (msgRetry && msgRetry.payload.pass < store.passSeq) {
+        const r = msgRetry.payload;
+        await this.migrateOne(ctx, r, r.srcMsgId, {
+          tries: r.tries,
+          retryWorkId: msgRetry.id,
+          done: () => {
+            store.popWork(msgRetry.id);
+            ctx.budget.itemDone();
+          },
+        });
+        continue;
+      }
+
       const work = store.peekWork<ScanWork>(W, 'scan');
       if (!work) return 'done';
       const scan = work.payload;
-      const cursorKey = this.deltaCursorKey(scan.srcFolderId, ctx.pass.filters);
+      const cursorKey = `cursor:${W}:${this.deltaCursorKey(scan.srcFolderId, ctx.pass.filters)}`;
 
       const pending = store.getState<string[]>(W, 'pending') ?? [];
       if (pending.length > 0) {
-        await this.migrateOne(ctx, scan, pending);
+        await this.migrateOne(ctx, scan, pending[0]!, {
+          tries: 0,
+          done: () => {
+            pending.shift();
+            store.setState(W, 'pending', pending);
+            ctx.budget.itemDone();
+          },
+        });
         continue;
       }
 
-      // Fetch the next delta page for this folder.
-      let cursor = store.getJson<FolderCursor>(`cursor:${W}:${cursorKey}`);
-      const folderDone = store.getState<boolean>(W, `pageDone:${scan.srcFolderId}`);
-      if (folderDone) {
-        store.delState(W, `pageDone:${scan.srcFolderId}`);
-        store.popWork(work.id);
+      // The page is fully handled: only now move the folder's persisted cursor
+      // past it. Advancing on fetch would let a pass that stops mid-page skip
+      // the page's remaining messages for good — resetPass() drops `pending`
+      // but keeps cursors. Re-reading a page after a stop is safe: the id map
+      // turns already-copied messages into skips.
+      const advance = store.getState<PageAdvance>(W, 'advance');
+      if (advance?.srcFolderId === scan.srcFolderId) {
+        if (advance.cursor) store.setJson(cursorKey, advance.cursor);
+        store.delState(W, 'advance');
+        if (advance.last) store.popWork(work.id);
         continue;
       }
-      const url = cursor?.url ?? this.initialDeltaUrl(ctx, scan.srcFolderId);
-      const page = await ctx.source.page<GraphMessage>(url, 40);
-      const ids = page.items.filter((m) => !m['@removed']).map((m) => m.id);
-      ctx.report.stat(W, 'discovered', ids.length);
-      store.setState(W, 'pending', ids);
-      if (page.deltaLink) {
-        store.setJson(`cursor:${W}:${cursorKey}`, { url: page.deltaLink, isDelta: true } satisfies FolderCursor);
-        store.setState(W, `pageDone:${scan.srcFolderId}`, true);
-      } else if (page.nextLink) {
-        store.setJson(`cursor:${W}:${cursorKey}`, { url: page.nextLink, isDelta: false } satisfies FolderCursor);
-      } else {
-        store.setState(W, `pageDone:${scan.srcFolderId}`, true);
+
+      // Fetch the next delta page for this folder. Cursors saved by older
+      // versions carry a server-side $filter (capped at 5,000 messages);
+      // those folders start over unfiltered.
+      let cursor = store.getJson<FolderCursor>(cursorKey);
+      if (cursor?.url.includes('filter=')) {
+        store.delRaw(cursorKey);
+        cursor = null;
       }
+      const url = cursor?.url ?? this.initialDeltaUrl(ctx, scan.srcFolderId);
+      let page: { items: GraphMessage[]; nextLink?: string; deltaLink?: string };
+      try {
+        page = await ctx.source.page<GraphMessage>(url, 40);
+      } catch (e) {
+        if (!(e instanceof GraphError) || e instanceof GraphThrottleError) throw e;
+        if (cursor && isSyncStateLost(e)) {
+          // The sync state behind the saved link expired or was reset: start
+          // the folder over. The id map turns copied messages into skips.
+          store.delRaw(cursorKey);
+          continue;
+        }
+        if (e.status === 404) {
+          // The folder was deleted at the source since it was enumerated.
+          store.delRaw(cursorKey);
+          store.popWork(work.id);
+          continue;
+        }
+        throw e;
+      }
+      const live = page.items.filter((m) => !m['@removed']);
+      const ids = live.filter((m) => inDateWindow(m.receivedDateTime, ctx.pass.filters)).map((m) => m.id);
+      ctx.report.stat(W, 'discovered', live.length);
+      if (live.length > ids.length) ctx.report.stat(W, 'skipped', live.length - ids.length);
+      store.setState(W, 'pending', ids);
+      store.setState(W, 'advance', {
+        srcFolderId: scan.srcFolderId,
+        cursor: page.deltaLink
+          ? { url: page.deltaLink, isDelta: true }
+          : page.nextLink
+            ? { url: page.nextLink, isDelta: false }
+            : undefined,
+        last: Boolean(page.deltaLink) || !page.nextLink,
+      } satisfies PageAdvance);
     }
     return 'continue';
   }
 
-  private finishMessage(ctx: MigrationContext, srcMsgId: string, destMsgId: string): void {
+  private finishMessage(ctx: MigrationContext, srcMsgId: string, destMsgId: string, msgRetryWorkId?: number): void {
     ctx.store.mapPut(W, 'item', srcMsgId, destMsgId);
-    ctx.store.delState(W, 'att');
-    const pending = ctx.store.getState<string[]>(W, 'pending') ?? [];
-    if (pending[0] === srcMsgId) {
-      pending.shift();
-      ctx.store.setState(W, 'pending', pending);
+    ctx.store.delCarry(W, 'att');
+    if (msgRetryWorkId !== undefined) {
+      ctx.store.popWork(msgRetryWorkId);
+    } else {
+      const pending = ctx.store.getState<string[]>(W, 'pending') ?? [];
+      if (pending[0] === srcMsgId) {
+        pending.shift();
+        ctx.store.setState(W, 'pending', pending);
+      }
     }
     ctx.report.stat(W, 'migrated');
     ctx.budget.itemDone();
   }
 
-  private async migrateOne(ctx: MigrationContext, scan: ScanWork, pending: string[]): Promise<void> {
+  /**
+   * Record a failed message. It is queued for a later pass (up to
+   * MAX_MESSAGE_TRIES attempts): once the delta cursor moves past it, the
+   * feed would never offer it again.
+   */
+  private queueMessageRetry(
+    ctx: MigrationContext,
+    target: MessageTarget,
+    msgId: string,
+    subject: string | undefined,
+    e: GraphError,
+    tries: number
+  ): void {
+    const attempt = tries + 1;
+    const final = attempt >= MAX_MESSAGE_TRIES;
+    ctx.report.itemError(W, {
+      itemType: 'message',
+      itemId: msgId,
+      itemName: subject,
+      code: e.code,
+      message: final
+        ? `${e.message} (giving up after ${attempt} attempts)`
+        : `${e.message} (will retry on the next pass, attempt ${attempt}/${MAX_MESSAGE_TRIES})`,
+    });
+    ctx.report.stat(W, 'failed');
+    if (!final) {
+      ctx.store.pushWork(W, 'msgretry', {
+        srcMsgId: msgId,
+        destFolderId: target.destFolderId,
+        asDraft: target.asDraft,
+        tries: attempt,
+        pass: ctx.store.passSeq,
+      } satisfies MsgRetryWork);
+    }
+  }
+
+  private async migrateOne(ctx: MigrationContext, target: MessageTarget, msgId: string, job: MessageJob): Promise<void> {
     const { store, source, dest, report } = ctx;
-    const msgId = pending[0];
-    if (!msgId) return;
-    const skip = () => {
-      pending.shift();
-      store.setState(W, 'pending', pending);
-      ctx.budget.itemDone();
-    };
+    const skip = job.done;
 
     if (store.mapGet(W, 'item', msgId)) {
       report.stat(W, 'skipped');
@@ -332,8 +486,7 @@ export class MailEngine implements WorkloadEngine {
           // deleted at source since enumeration
           report.stat(W, 'skipped');
         } else {
-          report.itemError(W, { itemType: 'message', itemId: msgId, code: e.code, message: e.message });
-          report.stat(W, 'failed');
+          this.queueMessageRetry(ctx, target, msgId, undefined, e, job.tries);
         }
         skip();
         return;
@@ -341,10 +494,8 @@ export class MailEngine implements WorkloadEngine {
       throw e;
     }
 
-    // Defense-in-depth date filtering (the delta query already filters).
-    const recv = msg.receivedDateTime;
-    const { mailReceivedBefore, mailReceivedAfter } = ctx.pass.filters;
-    if (recv && ((mailReceivedBefore && recv > mailReceivedBefore) || (mailReceivedAfter && recv < mailReceivedAfter))) {
+    // The page was filtered by date already; this covers retried messages.
+    if (!inDateWindow(msg.receivedDateTime, ctx.pass.filters)) {
       report.stat(W, 'skipped');
       skip();
       return;
@@ -353,8 +504,10 @@ export class MailEngine implements WorkloadEngine {
     // Optional convergence net: if the destination already holds this message
     // (matched by Internet Message-ID), map it instead of duplicating. When the
     // existing copy is missing its attachments (e.g. a pre-fix failure), queue
-    // them for repair.
-    if (ctx.pass.filters.mailDedupeByMessageId && msg.internetMessageId) {
+    // them for repair. Always done for a retried message: the attempt that
+    // failed may have created it before the error came back.
+    if ((ctx.pass.filters.mailDedupeByMessageId || job.tries > 0) && msg.internetMessageId) {
+      let hit: { id: string; hasAttachments?: boolean } | undefined;
       try {
         const safe = msg.internetMessageId.replace(/'/g, "''");
         const found = await dest.get<{ value: { id: string; hasAttachments?: boolean }[] }>(
@@ -362,10 +515,16 @@ export class MailEngine implements WorkloadEngine {
             `internetMessageId eq '${safe}'`
           )}&$select=id,hasAttachments&$top=1`
         );
-        const hit = found.value?.[0];
-        if (hit) {
-          store.mapPut(W, 'item', msgId, hit.id);
-          if (msg.hasAttachments && !hit.hasAttachments) {
+        hit = found.value?.[0];
+      } catch (e) {
+        // Dedupe is best-effort, so a failed lookup falls through and creates
+        // the message — but a throttle must pause the tick instead: creating
+        // here is exactly the duplicate this check exists to prevent.
+        if (e instanceof GraphThrottleError) throw e;
+      }
+      if (hit) {
+        if (msg.hasAttachments && !hit.hasAttachments) {
+          try {
             const list = await source.get<{ value: GraphAttachment[] }>(
               `${ctx.sourceUserPath}/messages/${msgId}/attachments?$select=id,name,contentType,size,isInline`
             );
@@ -379,47 +538,49 @@ export class MailEngine implements WorkloadEngine {
                 tries: 0,
               } satisfies AttRetryWork);
             }
+          } catch (e) {
+            if (!(e instanceof GraphError) || e instanceof GraphThrottleError) throw e;
+            report.itemError(W, {
+              itemType: 'attachment',
+              itemId: msgId,
+              itemName: msg.subject,
+              code: e.code,
+              message: `existing copy is missing attachments, which could not be listed: ${e.message}`,
+            });
           }
-          report.stat(W, 'skipped');
-          skip();
-          return;
         }
-      } catch {
-        // dedupe is best-effort — fall through and create the message
+        store.mapPut(W, 'item', msgId, hit.id);
+        report.stat(W, 'skipped');
+        skip();
+        return;
       }
     }
 
-    const asDraft = scan.asDraft || msg.isDraft === true;
+    const asDraft = target.asDraft || msg.isDraft === true;
     try {
       const created = await dest.post<{ id: string }>(
-        `${ctx.destUserPath}/mailFolders/${scan.destFolderId}/messages`,
+        `${ctx.destUserPath}/mailFolders/${target.destFolderId}/messages`,
         buildMessagePayload(msg, { asDraft })
       );
       ctx.report.bytes(W, msg.body?.content?.length ?? 0);
       if (msg.hasAttachments) {
-        const list = await source.get<{ value: GraphAttachment[] }>(
-          `${ctx.sourceUserPath}/messages/${msgId}/attachments?$select=id,name,contentType,size,isInline`
-        );
+        // Record the copy before anything else can throw: a throttle while
+        // listing attachments must resume this message, not create it again.
         const att: AttachmentResume = {
           srcMsgId: msgId,
           destMsgId: created.id,
-          remaining: (list.value ?? []).map((a) => ({ id: a.id, name: a.name, size: a.size ?? 0 })),
+          unlisted: true,
+          remaining: [],
+          msgRetryWorkId: job.retryWorkId,
         };
-        store.setState(W, 'att', att);
+        store.setCarry(W, 'att', att);
         await this.copyAttachments(ctx, att);
       }
-      this.finishMessage(ctx, msgId, created.id);
+      this.finishMessage(ctx, msgId, created.id, job.retryWorkId);
     } catch (e) {
       if (e instanceof GraphError && e.name !== 'GraphThrottleError') {
-        report.itemError(W, {
-          itemType: 'message',
-          itemId: msgId,
-          itemName: msg.subject,
-          code: e.code,
-          message: e.message,
-        });
-        report.stat(W, 'failed');
-        store.delState(W, 'att');
+        this.queueMessageRetry(ctx, target, msgId, msg.subject, e, job.tries);
+        store.delCarry(W, 'att');
         skip();
         return;
       }
@@ -464,8 +625,43 @@ export class MailEngine implements WorkloadEngine {
     } satisfies AttRetryWork);
   }
 
+  /** Real byte length of an attachment's content (from a 1-byte ranged read), or null if unknown. */
+  private async attachmentLength(ctx: MigrationContext, srcMsgId: string, attId: string): Promise<number | null> {
+    const res = await ctx.source.requestRaw(
+      'GET',
+      `${ctx.sourceUserPath}/messages/${srcMsgId}/attachments/${attId}/$value`,
+      { headers: { range: 'bytes=0-0' } }
+    );
+    const total = /\/(\d+)\s*$/.exec(res.headers.get('content-range') ?? '')?.[1];
+    const length = total ?? (res.status === 200 ? res.headers.get('content-length') : null);
+    await res.body?.cancel();
+    const n = length ? parseInt(length, 10) : NaN;
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+
   private async copyAttachments(ctx: MigrationContext, att: AttachmentResume): Promise<void> {
     const { store, source, dest, report } = ctx;
+
+    if (att.unlisted) {
+      try {
+        const list = await source.get<{ value: GraphAttachment[] }>(
+          `${ctx.sourceUserPath}/messages/${att.srcMsgId}/attachments?$select=id,name,contentType,size,isInline`
+        );
+        att.remaining = (list.value ?? []).map((a) => ({ id: a.id, name: a.name, size: a.size ?? 0 }));
+      } catch (e) {
+        if (!(e instanceof GraphError) || e instanceof GraphThrottleError) throw e;
+        // The message itself is copied; record the gap rather than fail it
+        // (a failed message would be copied again — a duplicate).
+        report.itemError(W, {
+          itemType: 'attachment',
+          itemId: att.srcMsgId,
+          code: e.code,
+          message: `message copied but its attachments could not be listed: ${e.message}`,
+        });
+      }
+      att.unlisted = false;
+      store.setCarry(W, 'att', att);
+    }
 
     while (att.upload || att.remaining.length > 0) {
       if (att.upload) {
@@ -474,7 +670,7 @@ export class MailEngine implements WorkloadEngine {
         const range = nextChunkRange(up.offset, up.size, MAIL_ATTACHMENT_CHUNK_SIZE);
         if (!range) {
           att.upload = undefined;
-          store.setState(W, 'att', att);
+          store.setCarry(W, 'att', att);
           continue;
         }
         try {
@@ -483,16 +679,19 @@ export class MailEngine implements WorkloadEngine {
             `${ctx.sourceUserPath}/messages/${att.srcMsgId}/attachments/${up.attId}/$value`,
             { headers: { range: `bytes=${range.start}-${range.end}` } }
           );
-          let bytes = await res.arrayBuffer();
-          if (res.status === 200 && bytes.byteLength > range.length) {
-            // source ignored the Range header and returned the full content
-            bytes = bytes.slice(range.start, range.end + 1);
+          const bytes = await readByteRange(res, range.start, range.length);
+          if (bytes.byteLength !== range.length) {
+            throw new GraphError(
+              502,
+              'attachment_short_read',
+              `expected ${range.length} bytes of attachment content at offset ${range.start}, got ${bytes.byteLength}`
+            );
           }
           const result = await putUploadChunk(up.sessionUrl, bytes, range.start, range.end, up.size);
-          up.offset = range.end + 1;
-          report.bytes(W, range.length);
+          up.offset = result.nextOffset ?? range.end + 1;
+          if (result.nextOffset === undefined) report.bytes(W, range.length);
           if (result.done || up.offset >= up.size) att.upload = undefined;
-          store.setState(W, 'att', att);
+          store.setCarry(W, 'att', att);
         } catch (e) {
           if (!(e instanceof GraphError) || e.name === 'GraphThrottleError') throw e;
           this.queueAttachmentRetry(
@@ -503,7 +702,7 @@ export class MailEngine implements WorkloadEngine {
             e.message
           );
           att.upload = undefined;
-          store.setState(W, 'att', att);
+          store.setCarry(W, 'att', att);
         }
         continue;
       }
@@ -511,20 +710,27 @@ export class MailEngine implements WorkloadEngine {
       const next = att.remaining[0];
       if (!next) break;
       try {
-        if (next.size > LARGE_ATTACHMENT_THRESHOLD) {
+        // An upload session must be declared with the exact byte length, and
+        // the metadata size can differ from it (it did by ~150 KB in Graph's
+        // own example), so measure the content when it looks large.
+        const size =
+          next.size > LARGE_ATTACHMENT_THRESHOLD
+            ? ((await this.attachmentLength(ctx, att.srcMsgId, next.id)) ?? next.size)
+            : next.size;
+        if (size > LARGE_ATTACHMENT_THRESHOLD) {
           const session = await dest.post<{ uploadUrl: string }>(
             `${ctx.destUserPath}/messages/${att.destMsgId}/attachments/createUploadSession`,
             {
               AttachmentItem: {
                 attachmentType: 'file',
                 name: next.name ?? 'attachment',
-                size: next.size,
+                size,
               },
             }
           );
-          att.upload = { attId: next.id, sessionUrl: session.uploadUrl, offset: 0, size: next.size, name: next.name };
+          att.upload = { attId: next.id, sessionUrl: session.uploadUrl, offset: 0, size, name: next.name };
           att.remaining.shift();
-          store.setState(W, 'att', att);
+          store.setCarry(W, 'att', att);
           continue;
         }
         const full = await source.get<GraphAttachment>(
@@ -553,13 +759,13 @@ export class MailEngine implements WorkloadEngine {
           });
         }
         att.remaining.shift();
-        store.setState(W, 'att', att);
+        store.setCarry(W, 'att', att);
       } catch (e) {
         if (e instanceof GraphError && e.name !== 'GraphThrottleError') {
           this.queueAttachmentRetry(ctx, att, next, e.code, e.message);
           att.upload = undefined;
           att.remaining.shift();
-          store.setState(W, 'att', att);
+          store.setCarry(W, 'att', att);
           continue;
         }
         throw e;

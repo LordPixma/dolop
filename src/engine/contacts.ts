@@ -3,6 +3,7 @@
 
 import { GraphError } from '../graph/client';
 import type { GraphContact, GraphContactFolder } from '../graph/types';
+import { drainPages } from './paged';
 import { buildContactPayload } from './transform';
 import type { MigrationContext, StepResult, WorkloadEngine } from './workload';
 
@@ -25,7 +26,9 @@ export class ContactsEngine implements WorkloadEngine {
 
   private async folders(ctx: MigrationContext): Promise<StepResult> {
     const { store, source, dest, report } = ctx;
-    store.pushWork(W, 'scan', { srcPath: '/contacts', destPath: '/contacts', name: 'Contacts' } satisfies ScanWork);
+    // Scans are queued only once every folder is resolved, so a throttle
+    // part-way through (which re-runs this phase) can't queue one twice.
+    const scans: ScanWork[] = [{ srcPath: '/contacts', destPath: '/contacts', name: 'Contacts' }];
 
     const [srcFolders, dstFolders] = await Promise.all([
       source.listAll<GraphContactFolder>(`${ctx.sourceUserPath}/contactFolders?$top=100`),
@@ -60,69 +63,59 @@ export class ContactsEngine implements WorkloadEngine {
         }
         store.mapPut(W, 'folder', f.id, destId);
       }
-      store.pushWork(W, 'scan', {
+      scans.push({
         srcPath: `/contactFolders/${f.id}/contacts`,
         destPath: `/contactFolders/${destId}/contacts`,
         name: f.displayName ?? '',
-      } satisfies ScanWork);
+      });
     }
+    for (const s of scans) store.pushWork(W, 'scan', s);
     store.setPhase(W, 'items');
     return 'continue';
   }
 
   private async items(ctx: MigrationContext): Promise<StepResult> {
-    const { store, source, dest, report } = ctx;
+    const { store } = ctx;
     while (!ctx.budget.exhausted) {
       const work = store.peekWork<ScanWork>(W, 'scan');
       if (!work) return 'done';
       const scan = work.payload;
-
-      const url =
-        store.getState<string>(W, `next:${scan.srcPath}`) ??
-        `${ctx.sourceUserPath}${scan.srcPath}?$top=50`;
-      const page = await source.page<GraphContact>(url, 50);
-
-      for (const contact of page.items) {
-        if (ctx.budget.exhausted) break;
-        report.stat(W, 'discovered');
-        if (store.mapGet(W, 'item', contact.id)) {
-          report.stat(W, 'skipped');
-          ctx.budget.itemDone();
-          continue;
-        }
-        try {
-          const created = await dest.post<{ id: string }>(
-            `${ctx.destUserPath}${scan.destPath}`,
-            buildContactPayload(contact)
-          );
-          store.mapPut(W, 'item', contact.id, created.id);
-          report.stat(W, 'migrated');
-          ctx.budget.itemDone();
-        } catch (e) {
-          if (e instanceof GraphError && e.name !== 'GraphThrottleError') {
-            report.itemError(W, {
-              itemType: 'contact',
-              itemId: contact.id,
-              itemName: contact.displayName,
-              code: e.code,
-              message: e.message,
-            });
-            report.stat(W, 'failed');
-            store.mapPut(W, 'item', contact.id, 'failed');
-            ctx.budget.itemDone();
-            continue;
-          }
-          throw e;
-        }
-      }
-
-      if (page.nextLink) {
-        store.setState(W, `next:${scan.srcPath}`, page.nextLink);
-      } else {
-        store.delState(W, `next:${scan.srcPath}`);
-        store.popWork(work.id);
-      }
+      const finished = await drainPages<GraphContact>(
+        ctx,
+        W,
+        { key: scan.srcPath, firstUrl: `${ctx.sourceUserPath}${scan.srcPath}?$top=50`, pageSize: 50 },
+        (contact) => this.copyContact(ctx, scan, contact)
+      );
+      if (finished) store.popWork(work.id);
     }
     return 'continue';
+  }
+
+  private async copyContact(ctx: MigrationContext, scan: ScanWork, contact: GraphContact): Promise<void> {
+    const { store, dest, report } = ctx;
+    report.stat(W, 'discovered');
+    if (store.mapGet(W, 'item', contact.id)) {
+      report.stat(W, 'skipped'); // no Graph call, so it doesn't count against the tick's item budget
+      return;
+    }
+    try {
+      const created = await dest.post<{ id: string }>(
+        `${ctx.destUserPath}${scan.destPath}`,
+        buildContactPayload(contact)
+      );
+      store.mapPut(W, 'item', contact.id, created.id);
+      report.stat(W, 'migrated');
+    } catch (e) {
+      if (!(e instanceof GraphError) || e.name === 'GraphThrottleError') throw e;
+      report.itemError(W, {
+        itemType: 'contact',
+        itemId: contact.id,
+        itemName: contact.displayName,
+        code: e.code,
+        message: e.message,
+      });
+      report.stat(W, 'failed'); // left unmapped, so the next pass retries it
+    }
+    ctx.budget.itemDone();
   }
 }

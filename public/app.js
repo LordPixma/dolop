@@ -35,6 +35,30 @@ async function api(method, path, body, opts = {}) {
   return data;
 }
 
+/** /api/auth/status, sent with the API token when one is in use. */
+async function fetchStatus() {
+  const headers = getToken() ? { authorization: `Bearer ${getToken()}` } : {};
+  return fetch('/api/auth/status', { headers }).then((r) => r.json());
+}
+
+let sessionInfo = null;
+
+/** Cached sign-in status; also shows the current workspace in the top bar. */
+async function loadSession(force = false) {
+  if (!sessionInfo || force) {
+    try { sessionInfo = await fetchStatus(); } catch { sessionInfo = null; }
+  }
+  const el = document.getElementById('ws-name');
+  if (el) el.textContent = sessionInfo?.workspace?.name || '';
+  return sessionInfo;
+}
+
+function clearSession() {
+  sessionInfo = null;
+  const el = document.getElementById('ws-name');
+  if (el) el.textContent = '';
+}
+
 // ---------------------------------------------------------------------------
 // Tiny UI helpers
 
@@ -161,8 +185,13 @@ function progressBar(user) {
 // ---------------------------------------------------------------------------
 // Sign-in (username/password sessions; API token as fallback/recovery)
 
+function authCard(inner, width = 460) {
+  return `<div class="card" style="max-width:${width}px;margin:8vh auto">${inner}</div>`;
+}
+
 async function renderLogin() {
   stopPolling();
+  clearSession();
   let status = { setupRequired: false };
   try { status = await fetch('/api/auth/status').then((r) => r.json()); } catch { /* show login anyway */ }
 
@@ -171,7 +200,9 @@ async function renderLogin() {
       <div class="card" style="max-width:460px;margin:8vh auto">
         <h1>Welcome to dolop</h1>
         <p class="sub">No operator accounts exist yet. Create the first administrator account for this deployment.</p>
-        <label>Username</label><input id="su-user" autocomplete="username" autofocus />
+        <label>Organization / workspace name <span class="muted">(optional)</span></label>
+        <input id="su-ws" placeholder="Contoso IT" autofocus />
+        <label>Username</label><input id="su-user" autocomplete="username" />
         <label>Display name</label><input id="su-name" autocomplete="name" />
         <label>Password <span class="muted">(min 10 characters)</span></label>
         <input type="password" id="su-pass" autocomplete="new-password" />
@@ -186,6 +217,7 @@ async function renderLogin() {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({
+            workspaceName: document.getElementById('su-ws').value.trim() || undefined,
             username: document.getElementById('su-user').value.trim(),
             displayName: document.getElementById('su-name').value.trim() || undefined,
             password,
@@ -206,6 +238,7 @@ async function renderLogin() {
       <label>Username</label><input id="li-user" autocomplete="username" autofocus />
       <label>Password</label><input type="password" id="li-pass" autocomplete="current-password" />
       <div class="btnrow" style="margin-top:1rem"><button class="primary" id="li-go">Sign in</button></div>
+      ${status.registration === 'open' ? '<p class="sub" style="margin-top:1rem">New to dolop? <a href="#/register">Create an account</a> to run your own migration.</p>' : ''}
       <p class="sub" style="margin-top:1rem"><a href="#" id="li-token-toggle">Use an API token instead</a></p>
       <div id="li-token-pane" style="display:none">
         <label>API token <span class="muted">(also resets forgotten passwords via Account → Team)</span></label>
@@ -246,12 +279,118 @@ async function renderLogin() {
 }
 
 // ---------------------------------------------------------------------------
+// Self-service sign-up and invite links
+
+/** Shared password/identity fields for the sign-up and join forms. */
+function credentialFields(prefix) {
+  return `
+    <label>Username</label><input id="${prefix}-user" autocomplete="username" />
+    <label>Display name</label><input id="${prefix}-name" autocomplete="name" />
+    <label>Password <span class="muted">(min 10 characters)</span></label>
+    <input type="password" id="${prefix}-pass" autocomplete="new-password" />
+    <label>Confirm password</label><input type="password" id="${prefix}-pass2" autocomplete="new-password" />`;
+}
+
+function readCredentials(prefix) {
+  const password = document.getElementById(`${prefix}-pass`).value;
+  if (password !== document.getElementById(`${prefix}-pass2`).value) {
+    toast('Passwords do not match', 'error');
+    return null;
+  }
+  return {
+    username: document.getElementById(`${prefix}-user`).value.trim(),
+    displayName: document.getElementById(`${prefix}-name`).value.trim() || undefined,
+    password,
+  };
+}
+
+async function submitRegistration(body, btn) {
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/auth/register', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return toast(data.error || 'registration failed', 'error');
+    localStorage.removeItem(TOKEN_KEY);
+    clearSession();
+    toast('Account created — welcome to dolop!', 'ok');
+    if (location.hash === '#/') route(); else location.hash = '#/';
+  } catch (e) {
+    toast(e.message, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function renderRegister() {
+  stopPolling();
+  let status = {};
+  try { status = await fetchStatus(); } catch { /* treated as closed */ }
+  if (status.registration !== 'open') {
+    $app.innerHTML = authCard(`
+      <h1>Sign-up is closed</h1>
+      <p class="sub">This dolop deployment doesn't allow self-service sign-up. Ask one of its operators for an invite link.</p>
+      <p><a href="#/">Back to sign in</a></p>`);
+    return;
+  }
+  $app.innerHTML = authCard(`
+    <h1>Create your dolop account</h1>
+    <p class="sub">You get a private workspace: the tenants you connect, your migration projects and the teammates you invite are visible only inside it.</p>
+    <label>Organization / workspace name</label><input id="rg-ws" placeholder="Contoso → Fabrikam migration" autofocus />
+    ${credentialFields('rg')}
+    <div class="btnrow" style="margin-top:1rem"><button class="primary" id="rg-go">Create account</button></div>
+    <p class="sub" style="margin-top:1rem">Already have an account? <a href="#/">Sign in</a></p>`);
+  const btn = document.getElementById('rg-go');
+  btn.addEventListener('click', () => {
+    const creds = readCredentials('rg');
+    if (!creds) return;
+    submitRegistration({ ...creds, workspaceName: document.getElementById('rg-ws').value.trim() }, btn);
+  });
+}
+
+async function renderJoin(token) {
+  stopPolling();
+  let workspace = null;
+  let error = 'This invite link is invalid, expired or has already been used.';
+  try {
+    const res = await fetch(`/api/auth/invites/lookup?token=${encodeURIComponent(token)}`);
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) workspace = data.workspace; else if (data.error) error = data.error;
+  } catch (e) { error = e.message; }
+  if (!workspace) {
+    $app.innerHTML = authCard(`
+      <h1>Invite not valid</h1>
+      <p class="sub">${esc(error)} Ask whoever invited you for a new link.</p>
+      <p><a href="#/">Go to sign in</a></p>`);
+    return;
+  }
+  $app.innerHTML = authCard(`
+    <h1>Join ${esc(workspace.name)}</h1>
+    <p class="sub">You've been invited to this dolop workspace. Choose a username and password to create your account.</p>
+    ${credentialFields('jn')}
+    <div class="btnrow" style="margin-top:1rem"><button class="primary" id="jn-go">Create account &amp; join</button></div>`);
+  document.getElementById('jn-user').focus();
+  const btn = document.getElementById('jn-go');
+  btn.addEventListener('click', () => {
+    const creds = readCredentials('jn');
+    if (creds) submitRegistration({ ...creds, inviteToken: token }, btn);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Account & team page
 
 async function viewAccount() {
-  const status = await fetch('/api/auth/status').then((r) => r.json());
-  const { accounts } = await api('GET', '/api/auth/accounts');
-  const me = status.account;
+  const status = await loadSession(true);
+  const [{ accounts }, { invites }] = await Promise.all([
+    api('GET', '/api/auth/accounts'),
+    api('GET', '/api/auth/invites'),
+  ]);
+  const me = status && status.account;
+  const ws = (status && status.workspace) || { name: '' };
   const rows = accounts.map((a) => `
     <tr>
       <td><strong>${esc(a.username)}</strong>${me && me.id === a.id ? ' <span class="muted">(you)</span>' : ''}
@@ -262,25 +401,47 @@ async function viewAccount() {
         ${me && me.id === a.id ? '' : `<button class="small danger" data-del="${a.id}" data-username="${esc(a.username)}">Delete</button>`}
       </td>
     </tr>`).join('');
+  const inviteRows = invites.map((i) => `
+    <tr>
+      <td>${esc(i.note || '—')}</td>
+      <td class="muted" style="font-size:.8rem">${esc(i.createdBy || 'API token')}</td>
+      <td class="muted" style="font-size:.8rem">expires ${fmtDate(i.expiresAt)}</td>
+      <td class="right"><button class="small danger" data-revoke="${esc(i.id)}">Revoke</button></td>
+    </tr>`).join('');
   $app.innerHTML = `
     <div class="page-head">
       <div><h1>Account</h1>
-      <div class="sub">${me ? `Signed in as <strong>${esc(me.username)}</strong>` : 'Authenticated with the API token'}</div></div>
+      <div class="sub">${me ? `Signed in as <strong>${esc(me.username)}</strong>` : 'Authenticated with the API token'}
+        in workspace <strong>${esc(ws.name)}</strong></div></div>
     </div>
-    ${me ? `
-    <div class="card" style="max-width:480px">
-      <h3>Change password</h3>
-      <label>Current password</label><input type="password" id="cp-cur" autocomplete="current-password" />
-      <label>New password <span class="muted">(min 10 characters)</span></label>
-      <input type="password" id="cp-new" autocomplete="new-password" />
-      <div class="btnrow" style="margin-top:.9rem"><button class="primary" id="cp-go">Update password</button></div>
-    </div>` : ''}
+    <div class="formgrid" style="align-items:start">
+      ${me ? `
+      <div class="card">
+        <h3>Change password</h3>
+        <label>Current password</label><input type="password" id="cp-cur" autocomplete="current-password" />
+        <label>New password <span class="muted">(min 10 characters)</span></label>
+        <input type="password" id="cp-new" autocomplete="new-password" />
+        <div class="btnrow" style="margin-top:.9rem"><button class="primary" id="cp-go">Update password</button></div>
+      </div>` : ''}
+      <div class="card">
+        <h3>Workspace</h3>
+        <p class="sub">Connectors, projects and team members are private to this workspace.</p>
+        <label>Name</label><input id="ws-rename" value="${esc(ws.name)}" />
+        <div class="btnrow" style="margin-top:.9rem"><button id="ws-save">Rename</button></div>
+      </div>
+    </div>
     <div class="card">
       <div class="page-head" style="margin-bottom:.6rem">
         <h3 style="margin:0">Team</h3>
-        <button class="primary" id="ac-add">Add operator</button>
+        <div class="btnrow">
+          <button class="primary" id="ac-invite">Invite teammate</button>
+          <button id="ac-add">Add operator directly</button>
+        </div>
       </div>
       <table><thead><tr><th>Username</th><th>Last sign-in</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+      ${invites.length ? `
+      <h3 style="margin-top:1.2rem">Pending invites</h3>
+      <table><thead><tr><th>Note</th><th>Created by</th><th>Expiry</th><th></th></tr></thead><tbody>${inviteRows}</tbody></table>` : ''}
     </div>`;
   const cp = document.getElementById('cp-go');
   if (cp) cp.addEventListener('click', async () => {
@@ -293,9 +454,31 @@ async function viewAccount() {
       viewAccount();
     } catch (e) { toast(e.message, 'error'); }
   });
+  document.getElementById('ws-save').addEventListener('click', async () => {
+    try {
+      await api('PATCH', '/api/auth/workspace', { name: document.getElementById('ws-rename').value.trim() });
+      toast('Workspace renamed', 'ok');
+      viewAccount();
+    } catch (e) { toast(e.message, 'error'); }
+  });
+  document.getElementById('ac-invite').addEventListener('click', () => {
+    const m = modal(`
+      <h2>Invite a teammate</h2>
+      <p class="sub">Creates a single-use link, valid for 7 days, that lets someone choose their own username and password and join <strong>${esc(ws.name)}</strong>. They will see all of this workspace's connectors and projects.</p>
+      <label>Note <span class="muted">(optional — who it's for)</span></label><input id="iv-note" placeholder="Alex, service desk" />
+      <div class="actions"><button id="m-cancel">Cancel</button><button class="primary" id="m-save">Create link</button></div>`);
+    m.querySelector('#m-cancel').addEventListener('click', closeModal);
+    m.querySelector('#m-save').addEventListener('click', async () => {
+      try {
+        const r = await api('POST', '/api/auth/invites', { note: m.querySelector('#iv-note').value.trim() || undefined });
+        showInviteLink(r.url);
+      } catch (e) { toast(e.message, 'error'); }
+    });
+  });
   document.getElementById('ac-add').addEventListener('click', () => {
     const m = modal(`
       <h2>Add operator account</h2>
+      <p class="sub">Prefer an invite link — it lets the person pick their own password.</p>
       <label>Username</label><input id="na-user" />
       <label>Display name</label><input id="na-name" />
       <label>Password <span class="muted">(min 10 characters — share securely; they can change it after signing in)</span></label>
@@ -334,6 +517,23 @@ async function viewAccount() {
     try { await api('DELETE', `/api/auth/accounts/${b.dataset.del}`); viewAccount(); }
     catch (e) { toast(e.message, 'error'); }
   }));
+  $app.querySelectorAll('[data-revoke]').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm('Revoke this invite link? It will stop working immediately.')) return;
+    try { await api('DELETE', `/api/auth/invites/${b.dataset.revoke}`); viewAccount(); }
+    catch (e) { toast(e.message, 'error'); }
+  }));
+}
+
+function showInviteLink(url) {
+  const m = modal(`
+    <h2>Invite link</h2>
+    <p class="sub">Send this link to your teammate over a channel you trust. It works once and expires in 7 days; anyone holding it can join this workspace.</p>
+    <div class="linkbox"><input id="iv-url" class="mono" readonly value="${esc(url)}" /><button class="small" id="iv-copy">Copy</button></div>
+    <div class="actions"><button class="primary" id="iv-done">Done</button></div>`, { wide: true });
+  m.querySelector('#iv-copy').addEventListener('click', () => {
+    navigator.clipboard.writeText(url).then(() => toast('Link copied', 'ok'));
+  });
+  m.querySelector('#iv-done').addEventListener('click', () => { closeModal(); viewAccount(); });
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +559,16 @@ async function viewProjects() {
       <div class="sub">Each project migrates users from one tenant to another.</div></div>
       <button class="primary" id="new-project">New project</button>
     </div>
-    ${projects.length ? `<div class="grid">${cards}</div>` : '<div class="empty">No projects yet — create one to begin.</div>'}`;
+    ${projects.length ? `<div class="grid">${cards}</div>` : `
+    <div class="card" style="max-width:640px">
+      <h3>Get started</h3>
+      <ol class="steps">
+        <li><a href="#/connectors">Connect your tenants</a> — add a connector for the source tenant and one for the destination (an admin-consent link, or your own app registration).</li>
+        <li><strong>Create a project</strong> that pairs the two connectors.</li>
+        <li>Discover and map users, run an <strong>assessment</strong> pass, pre-stage, then cut over with a final delta.</li>
+      </ol>
+      <p class="sub">The <a href="https://github.com/LordPixma/dolop/blob/main/docs/runbook.md" target="_blank" rel="noopener">migration runbook</a> walks through each step.</p>
+    </div>`}`;
   document.getElementById('new-project').addEventListener('click', newProjectModal);
 }
 
@@ -1267,11 +1476,16 @@ async function route() {
   const hash = location.hash.replace(/^#\/?/, '');
   const parts = hash.split('/').filter(Boolean);
   try {
+    // Public pages (no session needed)
+    if (parts[0] === 'register') return await renderRegister();
+    if (parts[0] === 'join' && parts[1]) return await renderJoin(parts[1]);
+
     if (parts.length === 0) await viewProjects();
     else if (parts[0] === 'connectors') await viewConnectors();
     else if (parts[0] === 'account') await viewAccount();
     else if (parts[0] === 'projects' && parts[1]) await viewProject(parts[1], parts[2] || 'users');
     else await viewProjects();
+    loadSession();
   } catch (e) {
     if (e.message !== 'unauthorized') {
       $app.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
@@ -1283,6 +1497,7 @@ window.addEventListener('hashchange', route);
 document.getElementById('signout').addEventListener('click', async (e) => {
   e.preventDefault();
   localStorage.removeItem(TOKEN_KEY);
+  clearSession();
   try { await fetch('/api/auth/logout', { method: 'POST' }); } catch { /* session may already be gone */ }
   renderLogin();
 });

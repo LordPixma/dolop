@@ -43,24 +43,58 @@ interface TokenCacheEntry {
   expiresAt: number;
 }
 
+/** Default per-request timeout; byte-range transfers get TRANSFER_TIMEOUT_MS. */
+const REQUEST_TIMEOUT_MS = 60_000;
+export const TRANSFER_TIMEOUT_MS = 120_000;
+
+/** fetch with a deadline; a timeout surfaces as a clear Error (a failed tick, retried with backoff). */
+export async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  try {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  } catch (e) {
+    if (e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError')) {
+      throw new Error(`request timed out after ${Math.round(timeoutMs / 1000)}s: ${init.method ?? 'GET'} ${url.split('?')[0]}`);
+    }
+    throw e;
+  }
+}
+
+async function sha256Hex(s: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * KV key for a cached token. It includes a hash of the client secret, so a
+ * rotated or mistyped secret is checked against Entra instead of being served
+ * a token minted with the old one (which would let Verify pass for an hour).
+ */
+async function tokenCacheKey(creds: GraphCredentials): Promise<string> {
+  return `gtok:${creds.tenantId}:${creds.clientId}:${(await sha256Hex(creds.clientSecret)).slice(0, 16)}`;
+}
+
 /**
  * Acquire an app-only access token, cached in KV until shortly before expiry.
  */
-export async function acquireToken(creds: GraphCredentials, kv: KVNamespace): Promise<string> {
-  const cacheKey = `gtok:${creds.tenantId}:${creds.clientId}`;
+async function fetchToken(creds: GraphCredentials, kv: KVNamespace, timeoutMs: number): Promise<TokenCacheEntry> {
+  const cacheKey = await tokenCacheKey(creds);
   const cached = await kv.get<TokenCacheEntry>(cacheKey, 'json');
-  if (cached && cached.expiresAt > Date.now() + 60_000) return cached.token;
+  if (cached && cached.expiresAt > Date.now() + 60_000) return cached;
 
-  const res = await fetch(`https://login.microsoftonline.com/${creds.tenantId}/oauth2/v2.0/token`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      client_id: creds.clientId,
-      client_secret: creds.clientSecret,
-      scope: 'https://graph.microsoft.com/.default',
-      grant_type: 'client_credentials',
-    }),
-  });
+  const res = await fetchWithTimeout(
+    `https://login.microsoftonline.com/${creds.tenantId}/oauth2/v2.0/token`,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: creds.clientId,
+        client_secret: creds.clientSecret,
+        scope: 'https://graph.microsoft.com/.default',
+        grant_type: 'client_credentials',
+      }),
+    },
+    timeoutMs
+  );
   const body = (await res.json().catch(() => ({}))) as {
     access_token?: string;
     expires_in?: number;
@@ -74,12 +108,13 @@ export async function acquireToken(creds: GraphCredentials, kv: KVNamespace): Pr
       }`.trim()
     );
   }
-  const expiresAt = Date.now() + (body.expires_in ?? 3600) * 1000;
+  const entry: TokenCacheEntry = {
+    token: body.access_token,
+    expiresAt: Date.now() + (body.expires_in ?? 3600) * 1000,
+  };
   const ttl = Math.max(60, (body.expires_in ?? 3600) - 300);
-  await kv.put(cacheKey, JSON.stringify({ token: body.access_token, expiresAt }), {
-    expirationTtl: ttl,
-  });
-  return body.access_token;
+  await kv.put(cacheKey, JSON.stringify(entry), { expirationTtl: ttl });
+  return entry;
 }
 
 function parseRetryAfter(res: Response): number {
@@ -104,11 +139,29 @@ export interface PagedResponse<T> {
 export class GraphClient {
   /** Number of Graph HTTP calls issued (budget accounting). */
   requestCount = 0;
+  /** This client's token, so only the first request of a tick reads KV. */
+  private token: TokenCacheEntry | null = null;
+  private readonly timeoutMs: number;
 
   constructor(
     private creds: GraphCredentials,
-    private kv: KVNamespace
-  ) {}
+    private kv: KVNamespace,
+    opts: { timeoutMs?: number } = {}
+  ) {
+    this.timeoutMs = opts.timeoutMs ?? REQUEST_TIMEOUT_MS;
+  }
+
+  private async accessToken(): Promise<string> {
+    if (!this.token || this.token.expiresAt <= Date.now() + 60_000) {
+      this.token = await fetchToken(this.creds, this.kv, this.timeoutMs);
+    }
+    return this.token.token;
+  }
+
+  private async dropToken(): Promise<void> {
+    this.token = null;
+    await this.kv.delete(await tokenCacheKey(this.creds));
+  }
 
   get tenantId(): string {
     return this.creds.tenantId;
@@ -132,7 +185,7 @@ export class GraphClient {
     const url = path.startsWith('https://') ? path : `${GRAPH_BASE}${path}`;
     let attempt = 0;
     for (;;) {
-      const token = await acquireToken(this.creds, this.kv);
+      const token = await this.accessToken();
       const headers: Record<string, string> = {
         authorization: `Bearer ${token}`,
         ...(opts.headers ?? {}),
@@ -151,7 +204,7 @@ export class GraphClient {
         }
       }
       this.requestCount++;
-      const res = await fetch(url, { method, headers, body });
+      const res = await fetchWithTimeout(url, { method, headers, body }, this.timeoutMs);
 
       if (res.ok) return res;
 
@@ -159,12 +212,12 @@ export class GraphClient {
         await res.body?.cancel();
         throw new GraphThrottleError(res.status, parseRetryAfter(res), path);
       }
-      // One retry for transient 5xx and for a token that expired mid-flight.
-      if ((res.status >= 500 || res.status === 401) && attempt === 0) {
+      // One retry for a token that expired mid-flight, and for transient 5xx
+      // on idempotent requests. A POST is never re-sent: the 5xx may have come
+      // after the item was created, and a second POST would duplicate it.
+      if ((res.status === 401 || (res.status >= 500 && method !== 'POST')) && attempt === 0) {
         attempt++;
-        if (res.status === 401) {
-          await this.kv.delete(`gtok:${this.creds.tenantId}:${this.creds.clientId}`);
-        }
+        if (res.status === 401) await this.dropToken();
         await res.body?.cancel();
         await new Promise((r) => setTimeout(r, 1000));
         continue;
@@ -234,7 +287,11 @@ export class GraphClient {
    */
   async downloadRange(downloadUrl: string, start: number, end: number): Promise<ArrayBuffer> {
     this.requestCount++;
-    const res = await fetch(downloadUrl, { headers: { range: `bytes=${start}-${end}` } });
+    const res = await fetchWithTimeout(
+      downloadUrl,
+      { headers: { range: `bytes=${start}-${end}` } },
+      Math.max(this.timeoutMs, TRANSFER_TIMEOUT_MS)
+    );
     if (res.status === 429 || res.status === 503) {
       await res.body?.cancel();
       throw new GraphThrottleError(res.status, parseRetryAfter(res));

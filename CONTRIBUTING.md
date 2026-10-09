@@ -16,7 +16,10 @@ For a local dev server (`npm run dev`), create `.dev.vars`:
 ```
 ENCRYPTION_KEY=<openssl rand -base64 32>
 API_TOKEN=dev-token
+REGISTRATION_MODE=open   # optional: exercise self-service sign-up locally
 ```
+
+Apply the schema to the local database with `npm run db:migrate:local` first.
 
 `wrangler dev` runs D1/KV/R2/Queues/Durable Objects locally — no Cloudflare resources
 needed until you deploy. Exercising the migration engines end-to-end requires two M365
@@ -35,7 +38,10 @@ src/accounts.ts       Operator accounts, password hashing, sessions
 src/crypto.ts         AES-GCM secret encryption, HMAC-signed consent state
 migrations/           D1 schema migrations
 public/               Dependency-free dashboard SPA
-test/                 Vitest unit tests for pure logic
+test/                 Vitest unit tests for pure logic, API integration tests
+                      (node:sqlite-backed D1 running the real migrations) and engine
+                      tests (real engines + GraphClient against a fake Graph; see
+                      test/support)
 docs/                 Setup, runbook, architecture, FAQ, parity
 ```
 

@@ -86,6 +86,9 @@ export interface GraphEvent {
   reminderMinutesBeforeStart?: number;
   isReminderOn?: boolean;
   type?: 'singleInstance' | 'occurrence' | 'exception' | 'seriesMaster';
+  /** Time zone the event was created in (Windows name; "tzone://Microsoft/Custom" for legacy custom zones). */
+  originalStartTimeZone?: string;
+  originalEndTimeZone?: string;
 }
 
 export interface GraphContactFolder {

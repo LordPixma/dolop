@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decryptSecret, encryptSecret, signState, verifyState } from '../src/crypto';
+import { decodeJwtPayload, decryptSecret, encryptSecret, signState, verifyState } from '../src/crypto';
 
 function randomKey(): string {
   const bytes = new Uint8Array(32);
@@ -57,5 +57,23 @@ describe('signed consent state', () => {
     const key = randomKey();
     const state = await signState({ cid: 'con_abc123' }, key, -1000);
     expect(await verifyState(state, key)).toBeNull();
+  });
+});
+
+describe('decodeJwtPayload', () => {
+  it('decodes a base64url JWT payload', () => {
+    const json = new TextEncoder().encode(JSON.stringify({ tid: 'abc', aud: 'app', name: 'Zoë ~?' }));
+    const payload = btoa(String.fromCharCode(...json))
+      .replace(/=+$/, '')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_');
+    expect(decodeJwtPayload(`header.${payload}.sig`)).toEqual({ tid: 'abc', aud: 'app', name: 'Zoë ~?' });
+  });
+
+  it('returns null for malformed tokens', () => {
+    expect(decodeJwtPayload('')).toBeNull();
+    expect(decodeJwtPayload('onlyonepart')).toBeNull();
+    expect(decodeJwtPayload('a.!!!.c')).toBeNull();
+    expect(decodeJwtPayload(`a.${btoa('"string"')}.c`)).toBeNull();
   });
 });

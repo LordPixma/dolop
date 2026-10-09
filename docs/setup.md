@@ -109,13 +109,16 @@ openssl rand -hex 32    | wrangler secret put API_TOKEN
 - `API_TOKEN` — bearer token for the API. Day-to-day dashboard access uses username/password
   accounts (created on first visit); the token is for automation/CI and for resetting
   operator passwords if they're all forgotten (sign in with the token → Account → Team →
-  Reset password).
+  Reset password). It is a deployment-wide root credential: it acts on the default
+  workspace, or on any workspace named in an `X-Dolop-Workspace: <id>` header.
 
 For local development create `.dev.vars`:
 
 ```
 ENCRYPTION_KEY=<base64 32 bytes>
 API_TOKEN=dev-token
+# optional: try self-service sign-up locally
+REGISTRATION_MODE=open
 ```
 
 ## 4. Migrate schema and deploy
@@ -125,8 +128,8 @@ npm run db:migrate        # applies migrations/ to the remote D1 database
 npm run deploy
 ```
 
-Open the printed `*.workers.dev` URL (or your custom domain), sign in with the API token,
-then:
+Open the printed `*.workers.dev` URL (or your custom domain), create the first
+administrator account when prompted, then:
 
 1. **Connectors** → add both tenants → **Verify** each (checks token + core permissions).
 2. **Projects** → create a project, assign source/destination connectors.
@@ -137,3 +140,40 @@ then:
 Add the Worker's hostname as a [Cloudflare Access self-hosted application](https://developers.cloudflare.com/cloudflare-one/applications/configure-apps/self-hosted-public-app/)
 so reaching the dashboard requires your IdP login before the API token is even prompted.
 Service tokens can be issued for automation.
+
+## 6. Accounts, workspaces and sign-up
+
+Every account belongs to a **workspace**. Connectors, projects and team members are private
+to their workspace: operators never see, or can address by id, anything in another one. The
+first administrator (created on first visit) owns the deployment's default workspace;
+upgrading an existing deployment moves all existing accounts, connectors and projects into
+it, so nothing changes for an existing team.
+
+There are two ways for a new person to get an account:
+
+| | Team invite link | Self-service sign-up |
+| --- | --- | --- |
+| Result | Joins the inviter's workspace (sees its tenants and projects) | Gets a brand-new, empty workspace of their own |
+| How | **Account → Invite teammate** creates a single-use link, valid 7 days | **Create an account** on the sign-in page |
+| Enabled | Always | Only when `REGISTRATION_MODE` is `open` |
+
+To open self-service sign-up, set the var in `wrangler.jsonc` and redeploy:
+
+```jsonc
+"vars": { "REGISTRATION_MODE": "open" }
+```
+
+Before you do, consider what it means for your deployment:
+
+- **Anyone on the internet can create a workspace** and use your Cloudflare resources
+  (sign-ups are rate-limited to 5 per IP per hour). Put a WAF/Turnstile rule on
+  `/api/auth/register` if that matters, or keep sign-up closed and use invites.
+- **Your multi-tenant app (Option A) is shared by every workspace.** Each tenant can be bound
+  by consent in only one workspace, and once more than one workspace exists the consent link
+  adds a Microsoft sign-in step: after approving, the admin signs in at their tenant and
+  dolop takes the tenant id from the issued ID token instead of trusting the redirect URL.
+  The app therefore needs the delegated `openid` and `profile` permissions (the admin is
+  asked to accept them on first use). Tenants should still remove the enterprise
+  application when a migration ends.
+- Sign-up is only possible after first-run setup, so the deployment owner always claims
+  the default workspace first.

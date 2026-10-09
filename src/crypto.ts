@@ -113,3 +113,22 @@ export async function verifyState(
     return null;
   }
 }
+
+/**
+ * Decode a JWT's payload WITHOUT verifying its signature. Only for tokens
+ * received directly from the identity provider's token endpoint over TLS in
+ * an authenticated back-channel request (OpenID Connect Core §3.1.3.7 allows
+ * TLS server validation in place of signature checks for that case).
+ */
+export function decodeJwtPayload(jwt: string): Record<string, unknown> | null {
+  const part = jwt.split('.')[1];
+  if (!part) return null;
+  try {
+    const pad = '='.repeat((4 - (part.length % 4)) % 4);
+    const json = new TextDecoder().decode(b64decode(part.replace(/-/g, '+').replace(/_/g, '/') + pad));
+    const payload = JSON.parse(json) as unknown;
+    return payload && typeof payload === 'object' ? (payload as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}

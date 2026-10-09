@@ -2,11 +2,11 @@
 
 import { Hono } from 'hono';
 import { listAllProjectUsers, listItemErrors } from '../db';
-import type { Env, WorkloadStats } from '../types';
+import type { AppEnv, WorkloadStats } from '../types';
 import { nowIso, toCsv } from '../util';
 import { loadProject } from './helpers';
 
-export const reportsApi = new Hono<{ Bindings: Env }>();
+export const reportsApi = new Hono<AppEnv>();
 
 function sumStats(stats: Record<string, WorkloadStats>): WorkloadStats {
   const out = { discovered: 0, migrated: 0, skipped: 0, failed: 0, bytes: 0 };
@@ -22,7 +22,7 @@ function sumStats(stats: Record<string, WorkloadStats>): WorkloadStats {
 }
 
 reportsApi.get('/:projectId/report', async (c) => {
-  const project = await loadProject(c.env, c.req.param('projectId'));
+  const project = await loadProject(c.env, c.var.workspaceId, c.req.param('projectId'));
   const type = c.req.query('type') === 'errors' ? 'errors' : 'users';
 
   let csv: string;

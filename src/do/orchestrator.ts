@@ -176,6 +176,15 @@ export class MigrationOrchestrator extends DurableObject<Env> {
     if (!srcCon || !dstCon) {
       return Response.json({ error: 'connector not found' }, { status: 400 });
     }
+    // Defense in depth: the API only lets a project reference its own
+    // workspace's connectors, and a user only belongs to one project.
+    if (
+      user.projectId !== projectId ||
+      srcCon.workspaceId !== project.workspaceId ||
+      dstCon.workspaceId !== project.workspaceId
+    ) {
+      return Response.json({ error: 'user or connectors do not belong to this project' }, { status: 400 });
+    }
     for (const con of [srcCon, dstCon]) {
       if (con.authMode === 'consent' && !con.tenantId) {
         return Response.json(

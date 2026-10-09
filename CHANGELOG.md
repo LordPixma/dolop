@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+- **Migration engine fixes** (from a full engine review, verified against Microsoft's Graph docs):
+  - OneDrive files are placed by folder id. Delta results carry no paths, so every file
+    used to land in the drive root and same-named files overwrote each other. Folder
+    renames/moves and file moves now carry over. Nested files copied by older versions
+    are re-copied into their folders; their stray copies at the destination root can be
+    deleted.
+  - Mail pre-stage works (Graph rejected its `le` date filter) and received-after passes no
+    longer stop at 5,000 messages; cutoffs are applied client-side.
+  - Large mail attachments (over ~3.75 MB) upload completely and use the exact content
+    length.
+  - Failed items are retried on later passes (up to 3 attempts) instead of being skipped
+    forever; expired delta tokens restart enumeration instead of failing every pass.
+  - Throttling no longer duplicates messages or drops checklist items / attendee lists;
+    a POST is never auto-resent; Graph requests time out; tokens are cached per secret.
+  - Deleted Items / Junk subfolders stay excluded; recurring meetings keep their time zone
+    across DST.
+
+- **Fixed: contacts, calendar events and To Do tasks could be silently skipped.** When a
+  tick's budget ran out part-way through a Graph page (always, for contacts: 50-item pages
+  vs. a 25-item budget), the rest of that page was never migrated and no error was logged.
+  These workloads now resume mid-page. Items missed by earlier passes are picked up by the
+  next pass of any type. Re-walking already-migrated items is also much faster.
+- **Fixed: a stopped or failed pass could lose mail and OneDrive work.** Delta cursors
+  advanced when a page was *fetched*, but a new pass discards whatever was still queued,
+  so messages on a partly-processed page, queued OneDrive files and an in-flight large
+  upload were skipped forever. Cursors now advance only once a page is fully handled, and
+  a message whose attachments were mid-copy is finished by the next pass instead of being
+  duplicated.
+
+- **Workspaces, sign-up and invites**: accounts, connectors and projects now belong to
+  isolated workspaces (existing data moves into a default workspace — migration
+  `0006_workspaces.sql`). New users can join a team through single-use **invite links**
+  (Account → Invite teammate) or, when `REGISTRATION_MODE=open`, **sign up** for their own
+  workspace from the sign-in page. API-token requests act on the default workspace or the
+  one named in `X-Dolop-Workspace`.
+- **Security**: the public consent callback escaped none of Microsoft's error text
+  (reflected XSS) — fixed; consent binding now refuses a tenant owned by another
+  workspace and, with multiple workspaces, verifies the tenant through an OIDC sign-in;
+  starting a pass with `userIds` from another project is no longer possible; project
+  settings are validated and clamped server-side.
+
 - **Mail coexistence (dual-delivery)**: optionally keep both tenants' mailboxes fed during the
   migration overlap window. Dolop manages a single forwarding inbox rule per mailbox that
   forwards a copy of incoming mail to the user's counterpart in the other tenant, so mail to

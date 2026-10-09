@@ -28,6 +28,7 @@ function parseJson<T>(s: unknown, fallback: T): T {
 
 interface ConnectorRow {
   id: string;
+  workspace_id: string | null;
   name: string;
   tenant_id: string;
   client_id: string;
@@ -42,6 +43,7 @@ interface ConnectorRow {
 function rowToConnector(r: ConnectorRow): Connector & { clientSecretEnc: string } {
   return {
     id: r.id,
+    workspaceId: r.workspace_id ?? '',
     name: r.name,
     tenantId: r.tenant_id,
     clientId: r.client_id,
@@ -57,6 +59,7 @@ function rowToConnector(r: ConnectorRow): Connector & { clientSecretEnc: string 
 export async function createConnector(
   db: D1Database,
   data: {
+    workspaceId: string;
     name: string;
     tenantId: string;
     clientId: string;
@@ -69,11 +72,12 @@ export async function createConnector(
   const now = nowIso();
   await db
     .prepare(
-      `INSERT INTO connectors (id, name, tenant_id, client_id, client_secret_enc, auth_mode, verify_status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO connectors (id, workspace_id, name, tenant_id, client_id, client_secret_enc, auth_mode, verify_status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       id,
+      data.workspaceId,
       data.name,
       data.tenantId,
       data.clientId,
@@ -99,9 +103,32 @@ export async function bindConsentTenant(
     .run();
 }
 
-export async function listConnectors(db: D1Database): Promise<Connector[]> {
+/**
+ * Another workspace's consent-mode connector already bound to this tenant, if
+ * any. A tenant can only be connected through the deployment's shared
+ * multi-tenant app by one workspace — otherwise anyone who registers could
+ * point a connector at a tenant that consented for someone else.
+ */
+export async function consentTenantOwner(
+  db: D1Database,
+  tenantId: string,
+  workspaceId: string
+): Promise<{ id: string; workspaceId: string } | null> {
+  const row = await db
+    .prepare(
+      `SELECT id, workspace_id FROM connectors
+       WHERE auth_mode = 'consent' AND tenant_id = ? COLLATE NOCASE AND workspace_id IS NOT ?
+       LIMIT 1`
+    )
+    .bind(tenantId, workspaceId)
+    .first<{ id: string; workspace_id: string | null }>();
+  return row ? { id: row.id, workspaceId: row.workspace_id ?? '' } : null;
+}
+
+export async function listConnectors(db: D1Database, workspaceId: string): Promise<Connector[]> {
   const { results } = await db
-    .prepare('SELECT * FROM connectors ORDER BY created_at DESC')
+    .prepare('SELECT * FROM connectors WHERE workspace_id = ? ORDER BY created_at DESC')
+    .bind(workspaceId)
     .all<ConnectorRow>();
   return results.map((r) => {
     const { clientSecretEnc: _omit, ...rest } = rowToConnector(r);
@@ -151,6 +178,7 @@ export async function deleteConnector(db: D1Database, id: string): Promise<void>
 
 interface ProjectRow {
   id: string;
+  workspace_id: string | null;
   name: string;
   description: string | null;
   source_connector_id: string | null;
@@ -164,6 +192,7 @@ interface ProjectRow {
 function rowToProject(r: ProjectRow): Project {
   return {
     id: r.id,
+    workspaceId: r.workspace_id ?? '',
     name: r.name,
     description: r.description ?? undefined,
     sourceConnectorId: r.source_connector_id ?? undefined,
@@ -178,6 +207,7 @@ function rowToProject(r: ProjectRow): Project {
 export async function createProject(
   db: D1Database,
   data: {
+    workspaceId: string;
     name: string;
     description?: string;
     sourceConnectorId?: string;
@@ -190,11 +220,12 @@ export async function createProject(
   const settings = { ...DEFAULT_PROJECT_SETTINGS, ...(data.settings ?? {}) };
   await db
     .prepare(
-      `INSERT INTO projects (id, name, description, source_connector_id, dest_connector_id, settings, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO projects (id, workspace_id, name, description, source_connector_id, dest_connector_id, settings, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .bind(
       id,
+      data.workspaceId,
       data.name,
       data.description ?? null,
       data.sourceConnectorId ?? null,
@@ -207,9 +238,27 @@ export async function createProject(
   return id;
 }
 
-export async function listProjects(db: D1Database): Promise<Project[]> {
+export async function listProjects(db: D1Database, workspaceId: string): Promise<Project[]> {
+  const { results } = await db
+    .prepare('SELECT * FROM projects WHERE workspace_id = ? ORDER BY created_at DESC')
+    .bind(workspaceId)
+    .all<ProjectRow>();
+  return results.map(rowToProject);
+}
+
+/** Every project in every workspace — for the cron scheduler only, never the API. */
+export async function listAllProjects(db: D1Database): Promise<Project[]> {
   const { results } = await db.prepare('SELECT * FROM projects ORDER BY created_at DESC').all<ProjectRow>();
   return results.map(rowToProject);
+}
+
+/** Names of projects that reference a connector (as source or destination). */
+export async function projectsUsingConnector(db: D1Database, connectorId: string): Promise<string[]> {
+  const { results } = await db
+    .prepare('SELECT name FROM projects WHERE source_connector_id = ? OR dest_connector_id = ?')
+    .bind(connectorId, connectorId)
+    .all<{ name: string }>();
+  return results.map((r) => r.name);
 }
 
 export async function getProject(db: D1Database, id: string): Promise<Project | null> {

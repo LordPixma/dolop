@@ -33,9 +33,18 @@ at most one tick of repeated work.
 
 ### Engine state model (per-user DO SQLite)
 
-- `kv` — `phase:*` and `state:*` keys (reset every pass) plus `cursor:*` keys
+- `kv` — `phase:*` and `state:*` keys (reset every pass), `cursor:*` keys
   (**persist across passes**: mail per-folder delta links keyed by filter signature,
-  the OneDrive delta token).
+  the OneDrive delta token) and `carry:*` keys (in-flight work a stopped pass hands to
+  the next one, e.g. a message whose attachments are mid-copy).
+- **Cursor rule**: a persisted cursor only moves past a page once every item on that page
+  is handled, because a new pass discards whatever is still queued in pass state. A pass
+  stopped mid-page therefore re-reads that page next time, and the id map turns the
+  already-copied items into skips.
+- **Paged item workloads** (contacts, calendar, To Do) record their position *within* a
+  page — page URL, items handled, last item id — after every item, so a tick that runs out
+  of budget mid-page resumes at the next item. Id-map skips make no Graph call and don't
+  count against the tick's item budget.
 - `idmap` — source id → destination id per workload. This is the idempotency backbone:
   pre-stage → full → delta sequences never duplicate an item.
 - `work` — durable work queue (folder scans, pending file copies), drained across ticks.
@@ -68,7 +77,14 @@ any user still *running* with a heartbeat older than 10 minutes gets its orchest
 
 - Tenant client secrets: AES-256-GCM (random IV per encryption) under a key that exists only
   as a Worker secret; never returned by any API.
-- API: constant-time bearer-token check on every `/api` route; Cloudflare Access recommended
-  in front for IdP-backed access control.
+- API: session cookie or constant-time bearer-token check on every `/api` route; Cloudflare
+  Access recommended in front for IdP-backed access control.
+- Tenancy: every account, connector and project carries a `workspace_id`; `requireAuth` pins
+  each request to the caller's workspace and the `loadProject`/`loadConnector` helpers 404
+  anything outside it. Migration users, item errors and events are reached only through
+  their (already-checked) project.
+- Admin-consent callback: HMAC-signed state; a tenant is bound in at most one workspace, and
+  with several workspaces the tenant id is taken from an OIDC ID token rather than the
+  redirect's unsigned `tenant` parameter.
 - Graph access is app-only; consider Exchange application access policies to scope the app
   to in-scope mailboxes (see setup guide).

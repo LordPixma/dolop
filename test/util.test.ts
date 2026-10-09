@@ -3,6 +3,7 @@ import {
   backoffMs,
   chunkArray,
   csvCell,
+  escapeHtml,
   filterSignature,
   isPathExcluded,
   MAIL_ATTACHMENT_CHUNK_SIZE,
@@ -104,5 +105,14 @@ describe('backoffMs', () => {
       expect(v).toBeGreaterThan(0);
       expect(v).toBeLessThanOrEqual(60_000);
     }
+  });
+});
+
+describe('escapeHtml', () => {
+  it('neutralizes markup and attribute breakouts', () => {
+    expect(escapeHtml(`<img src=x onerror="a('b')">&`)).toBe(
+      '&#60;img src=x onerror=&#34;a(&#39;b&#39;)&#34;&#62;&#38;'
+    );
+    expect(escapeHtml('plain text')).toBe('plain text');
   });
 });

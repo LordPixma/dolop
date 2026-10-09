@@ -330,6 +330,56 @@ describe('mail engine', () => {
   });
 });
 
+describe('mail delta feed', () => {
+  // mailbox() dates message i on 2026-01-(i+1)
+  it('pre-stage copies only mail before the cutoff, then a full pass copies the rest', async () => {
+    const { allMessages, created } = mailbox(fake, 10);
+    const h = new EngineHarness(FULL);
+    h.newPass({ ...FULL, passType: 'prestage', filters: { mailReceivedBefore: '2026-01-05T00:00:00.000Z' } });
+    await h.run(new MailEngine());
+    expect(created.map((c) => c.subject)).toEqual(['Inbox 0', 'Inbox 1', 'Inbox 2', 'Inbox 3', 'Inbox 4']);
+    expect(h.stats.mail).toMatchObject({ migrated: 5, skipped: 5, failed: 0 });
+    h.newPass(FULL);
+    await h.run(new MailEngine());
+    expectEachOnce(created.map((c) => c.subject), allMessages.map((m) => m.subject));
+  });
+
+  it('applies a received-after cutoff without a server-side filter (Graph caps filtered delta at 5,000)', async () => {
+    const { created, deltaUrls } = mailbox(fake, 6);
+    const h = new EngineHarness({ ...FULL, filters: { mailReceivedAfter: '2026-01-04T00:00:00.000Z' } });
+    await h.run(new MailEngine());
+    expect(created.map((c) => c.subject)).toEqual(['Inbox 3', 'Inbox 4', 'Inbox 5']);
+    expect(deltaUrls.length).toBeGreaterThan(0);
+    expect(deltaUrls.filter((u) => new URL(u).searchParams.has('$filter'))).toEqual([]);
+  });
+
+  it('starts a folder over when its delta token has expired', async () => {
+    const { messages, created } = mailbox(fake, 3);
+    const h = new EngineHarness(FULL);
+    await h.run(new MailEngine());
+    // new mail arrives, and Graph has dropped the sync state behind the saved deltaLink
+    messages.get('f-inbox')!.push({ ...messages.get('f-inbox')![0]!, id: 'f-inbox-new', subject: 'Inbox new', internetMessageId: '<new@src.test>' });
+    fake.fail('GET', /\/messages\/delta$/, { status: 410 });
+    h.newPass();
+    await h.run(new MailEngine());
+    expectEachOnce(created.map((c) => c.subject), ['Inbox 0', 'Inbox 1', 'Inbox 2', 'Inbox new']);
+  });
+
+  it('finishes the pass when a source folder is deleted mid-migration', async () => {
+    const { messages, created } = mailTenant(fake, [
+      { id: 'f-inbox', name: 'Inbox', wellKnown: 'inbox', messages: 2 },
+      { id: 'f-gone', name: 'Gone', messages: 2 },
+    ]);
+    const h = new EngineHarness(FULL);
+    const engine = new MailEngine();
+    await h.tick(engine); // init
+    await h.tick(engine); // folders: both queued
+    messages.delete('f-gone'); // deleted at the source before its scan runs
+    await h.run(engine);
+    expect(created.map((c) => c.subject)).toEqual(['Inbox 0', 'Inbox 1']);
+  });
+});
+
 describe('drive engine', () => {
   const MB = 1024 * 1024;
 
@@ -376,7 +426,7 @@ describe('drive engine', () => {
         uploaded.push(s.name);
         return json({ id: `d-${s.name}` }, 201);
       });
-    return { uploaded };
+    return { uploaded, items };
   }
 
   it('does not lose queued files when a pass stops mid-page', async () => {
@@ -387,6 +437,18 @@ describe('drive engine', () => {
     h.newPass();
     await h.run(new DriveEngine());
     expectEachOnce(uploaded, files.map((f) => f.name));
+  });
+
+  it('re-enumerates when the delta token has expired', async () => {
+    const files = range(3).map((i) => ({ name: `file${i}.txt`, size: 10 }));
+    const { uploaded, items } = oneDrive(files);
+    const h = new EngineHarness(FULL);
+    await h.run(new DriveEngine());
+    items.push({ ...items[1]!, id: 'f-new', name: 'new.txt', cTag: 'ctag-new' } as (typeof items)[number]);
+    fake.fail('GET', /^\/drives\/src-drive\/root\/delta$/, { status: 410 });
+    h.newPass();
+    await h.run(new DriveEngine());
+    expectEachOnce(uploaded, [...files.map((f) => f.name), 'new.txt']);
   });
 
   it('copies a file that failed on the next pass', async () => {

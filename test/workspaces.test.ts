@@ -282,6 +282,32 @@ describe('workspace isolation', () => {
   });
 });
 
+describe('pass filters', () => {
+  it('rejects unparseable dates and stores cutoffs as UTC ISO strings', async () => {
+    const t = makeEnv();
+    const owner = await setupOwner(t);
+    const con = await addConnector(owner, 'Tenant');
+    const project = (await owner.post('/api/projects', { name: 'P', sourceConnectorId: con, destConnectorId: con })).body.id;
+    await owner.req('POST', `/api/projects/${project}/users/import`, 'a@src.test,a@dst.test', true);
+
+    const bad = await owner.post(`/api/projects/${project}/start`, {
+      passType: 'prestage',
+      filters: { mailReceivedBefore: "2026-01-01' or 1 eq 1" },
+    });
+    expect(bad.status).toBe(400);
+
+    const ok = await owner.post(`/api/projects/${project}/start`, {
+      passType: 'prestage',
+      filters: { mailReceivedBefore: '2026-01-31', mailReceivedAfter: '2025-06-01T09:00:00+02:00' },
+    });
+    expect(ok.status).toBe(200);
+    expect(ok.body.pass.filters).toEqual({
+      mailReceivedBefore: '2026-01-31T00:00:00.000Z',
+      mailReceivedAfter: '2025-06-01T07:00:00.000Z',
+    });
+  });
+});
+
 describe('team invites', () => {
   it('lets a new user join the inviting workspace exactly once', async () => {
     const t = makeEnv();

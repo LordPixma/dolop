@@ -173,6 +173,8 @@ export function mailTenant(fake: FakeGraph, folders: SrcMailFolder[]) {
     ['d-drafts', { name: 'Drafts', parent: null }],
   ]);
   const created: { id: string; folder: string; subject: string; internetMessageId?: string; attachments: string[] }[] = [];
+  /** Full URLs of every delta request (query included). */
+  const deltaUrls: string[] = [];
   const wk = WELL_KNOWN.join('|');
   fake
     .route('GET', new RegExp(`^/users/src/mailFolders/(${wk})$`), (req) => {
@@ -186,13 +188,20 @@ export function mailTenant(fake: FakeGraph, folders: SrcMailFolder[]) {
     .route('GET', /^\/users\/src\/mailFolders\/([^/]+)\/childFolders$/, (req) =>
       json({ value: folders.filter((f) => f.parent === req.m[1]).map(view) })
     )
-    .route('GET', /^\/users\/src\/mailFolders\/([^/]+)\/messages\/delta$/, (req) =>
-      pageOf(
-        (messages.get(req.m[1]!) ?? []).map((m) => ({ id: m.id, receivedDateTime: m.receivedDateTime })),
+    .route('GET', /^\/users\/src\/mailFolders\/([^/]+)\/messages\/delta$/, (req) => {
+      deltaUrls.push(req.url.toString());
+      // Like Graph: message delta only accepts receivedDateTime ge/gt filters.
+      const filter = req.url.searchParams.get('$filter');
+      if (filter && !/^receivedDateTime (ge|gt) \S+$/.test(filter)) {
+        return json({ error: { code: 'ErrorInvalidRestriction', message: 'unsupported filter' } }, 400);
+      }
+      if (!messages.has(req.m[1]!)) return json({ error: { code: 'ErrorItemNotFound' } }, 404);
+      return pageOf(
+        messages.get(req.m[1]!)!.map((m) => ({ id: m.id, receivedDateTime: m.receivedDateTime })),
         req,
         { delta: true }
-      )
-    )
+      );
+    })
     .route('GET', /^\/users\/src\/messages\/([^/]+)\/attachments$/, (req) =>
       json({
         value: range(attachmentCount.get(req.m[1]!) ?? 0).map((j) => ({ id: `${req.m[1]}-a${j}`, name: `file${j}.txt`, size: 5 })),
@@ -202,7 +211,7 @@ export function mailTenant(fake: FakeGraph, folders: SrcMailFolder[]) {
       json({ '@odata.type': '#microsoft.graph.fileAttachment', id: req.m[2], name: `${req.m[2]}.txt`, contentBytes: 'aGVsbG8=' })
     )
     .route('GET', /^\/users\/src\/messages\/([^/]+)$/, (req) => {
-      const m = allMessages.find((x) => x.id === req.m[1]);
+      const m = [...messages.values()].flat().find((x) => x.id === req.m[1]);
       return m ? json(m) : json({ error: { code: 'ErrorItemNotFound' } }, 404);
     })
     .route('POST', /^\/users\/dst\/mailFolders$/, (req) => {
@@ -230,7 +239,7 @@ export function mailTenant(fake: FakeGraph, folders: SrcMailFolder[]) {
       created.find((c) => c.id === req.m[1])!.attachments.push(req.body.name);
       return json({ id: 'att' }, 201);
     });
-  return { messages, allMessages, created, destFolders };
+  return { messages, allMessages, created, destFolders, deltaUrls };
 }
 
 /** A single inbox with `n` messages (and optional attachments per message index). */

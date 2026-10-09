@@ -8,7 +8,7 @@
 // memory). cTag comparison re-copies files whose content changed since the
 // previous pass.
 
-import { GraphError } from '../graph/client';
+import { GraphError, GraphThrottleError } from '../graph/client';
 import type { DriveItem, GraphDrive, UploadSession } from '../graph/types';
 import { isPathExcluded, LARGE_FILE_THRESHOLD, nextChunkRange } from '../util';
 import { putUploadChunk } from './upload';
@@ -159,8 +159,24 @@ export class DriveEngine implements WorkloadEngine {
 
   private async fetchDeltaPage(ctx: MigrationContext, srcDriveId: string): Promise<void> {
     const { store, source, report } = ctx;
-    const url = store.getCursor(W, 'delta') ?? `/drives/${srcDriveId}/root/delta`;
-    const page = await source.page<DriveItem>(url, 100);
+    const cursor = store.getCursor(W, 'delta');
+    let page: { items: DriveItem[]; nextLink?: string; deltaLink?: string };
+    try {
+      page = await source.page<DriveItem>(cursor ?? `/drives/${srcDriveId}/root/delta`, 100);
+    } catch (e) {
+      if (
+        cursor &&
+        e instanceof GraphError &&
+        !(e instanceof GraphThrottleError) &&
+        (e.status === 410 || /resync|syncstate/i.test(e.code))
+      ) {
+        // The token expired or Graph asked for a resync (410 Gone): enumerate
+        // from scratch. Files already copied with an unchanged cTag are skipped.
+        store.delCursor(W, 'delta');
+        return;
+      }
+      throw e;
+    }
 
     for (const item of page.items) {
       if (item.root !== undefined || item.deleted) continue;

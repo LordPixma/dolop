@@ -86,6 +86,23 @@ interface AttRetryWork {
 
 const MAX_ATTACHMENT_TRIES = 3;
 
+/** Whether a message's receivedDateTime falls inside the pass's date cutoffs. */
+function inDateWindow(
+  received: string | undefined,
+  filters: { mailReceivedBefore?: string; mailReceivedAfter?: string }
+): boolean {
+  const at = received ? Date.parse(received) : NaN;
+  if (Number.isNaN(at)) return true; // undated: don't silently drop it
+  if (filters.mailReceivedBefore && at > Date.parse(filters.mailReceivedBefore)) return false;
+  if (filters.mailReceivedAfter && at < Date.parse(filters.mailReceivedAfter)) return false;
+  return true;
+}
+
+/** Graph's answer when a delta/skip token's server-side sync state is gone. */
+function isSyncStateLost(e: GraphError): boolean {
+  return e.status === 410 || /syncstate|resync/i.test(e.code);
+}
+
 /** Where a message is copied to. */
 interface MessageTarget {
   destFolderId: string;
@@ -258,17 +275,13 @@ export class MailEngine implements WorkloadEngine {
     return `delta:${srcFolderId}:${filterSignature(filters)}`;
   }
 
+  /**
+   * Date cutoffs are applied to each page, not in the query: message delta
+   * only accepts `receivedDateTime ge|gt` (so the pre-stage `le` cutoff was
+   * rejected) and any `$filter` caps the whole delta at 5,000 messages.
+   */
   private initialDeltaUrl(ctx: MigrationContext, srcFolderId: string): string {
-    const filters: string[] = [];
-    if (ctx.pass.filters.mailReceivedBefore) {
-      filters.push(`receivedDateTime le ${ctx.pass.filters.mailReceivedBefore}`);
-    }
-    if (ctx.pass.filters.mailReceivedAfter) {
-      filters.push(`receivedDateTime ge ${ctx.pass.filters.mailReceivedAfter}`);
-    }
-    let url = `${ctx.sourceUserPath}/mailFolders/${srcFolderId}/messages/delta?$select=id,receivedDateTime`;
-    if (filters.length) url += `&$filter=${encodeURIComponent(filters.join(' and '))}`;
-    return url;
+    return `${ctx.sourceUserPath}/mailFolders/${srcFolderId}/messages/delta?$select=id,receivedDateTime`;
   }
 
   private async items(ctx: MigrationContext): Promise<StepResult> {
@@ -356,12 +369,38 @@ export class MailEngine implements WorkloadEngine {
         continue;
       }
 
-      // Fetch the next delta page for this folder.
-      const cursor = store.getJson<FolderCursor>(cursorKey);
+      // Fetch the next delta page for this folder. Cursors saved by older
+      // versions carry a server-side $filter (capped at 5,000 messages);
+      // those folders start over unfiltered.
+      let cursor = store.getJson<FolderCursor>(cursorKey);
+      if (cursor?.url.includes('filter=')) {
+        store.delRaw(cursorKey);
+        cursor = null;
+      }
       const url = cursor?.url ?? this.initialDeltaUrl(ctx, scan.srcFolderId);
-      const page = await ctx.source.page<GraphMessage>(url, 40);
-      const ids = page.items.filter((m) => !m['@removed']).map((m) => m.id);
-      ctx.report.stat(W, 'discovered', ids.length);
+      let page: { items: GraphMessage[]; nextLink?: string; deltaLink?: string };
+      try {
+        page = await ctx.source.page<GraphMessage>(url, 40);
+      } catch (e) {
+        if (!(e instanceof GraphError) || e instanceof GraphThrottleError) throw e;
+        if (cursor && isSyncStateLost(e)) {
+          // The sync state behind the saved link expired or was reset: start
+          // the folder over. The id map turns copied messages into skips.
+          store.delRaw(cursorKey);
+          continue;
+        }
+        if (e.status === 404) {
+          // The folder was deleted at the source since it was enumerated.
+          store.delRaw(cursorKey);
+          store.popWork(work.id);
+          continue;
+        }
+        throw e;
+      }
+      const live = page.items.filter((m) => !m['@removed']);
+      const ids = live.filter((m) => inDateWindow(m.receivedDateTime, ctx.pass.filters)).map((m) => m.id);
+      ctx.report.stat(W, 'discovered', live.length);
+      if (live.length > ids.length) ctx.report.stat(W, 'skipped', live.length - ids.length);
       store.setState(W, 'pending', ids);
       store.setState(W, 'advance', {
         srcFolderId: scan.srcFolderId,
@@ -455,10 +494,8 @@ export class MailEngine implements WorkloadEngine {
       throw e;
     }
 
-    // Defense-in-depth date filtering (the delta query already filters).
-    const recv = msg.receivedDateTime;
-    const { mailReceivedBefore, mailReceivedAfter } = ctx.pass.filters;
-    if (recv && ((mailReceivedBefore && recv > mailReceivedBefore) || (mailReceivedAfter && recv < mailReceivedAfter))) {
+    // The page was filtered by date already; this covers retried messages.
+    if (!inDateWindow(msg.receivedDateTime, ctx.pass.filters)) {
       report.stat(W, 'skipped');
       skip();
       return;

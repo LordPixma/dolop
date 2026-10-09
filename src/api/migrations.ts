@@ -12,6 +12,22 @@ export const migrationsApi = new Hono<AppEnv>();
 
 const PASS_TYPES: PassType[] = ['assessment', 'prestage', 'full', 'delta'];
 
+/** Date cutoffs must parse; they are stored as UTC ISO strings so engines can compare them. */
+function normalizeFilters(filters: PassConfig['filters'] | undefined): PassConfig['filters'] {
+  const out: PassConfig['filters'] = { ...(filters ?? {}) };
+  for (const key of ['mailReceivedBefore', 'mailReceivedAfter'] as const) {
+    const value: unknown = out[key];
+    if (value === undefined || value === null || value === '') {
+      delete out[key];
+      continue;
+    }
+    const at = typeof value === 'string' ? Date.parse(value) : NaN;
+    if (Number.isNaN(at)) throw new ApiError(400, `filters.${key} must be a date, e.g. 2026-01-31`);
+    out[key] = new Date(at).toISOString();
+  }
+  return out;
+}
+
 migrationsApi.post('/:projectId/start', async (c) => {
   const project = await loadProject(c.env, c.var.workspaceId, c.req.param('projectId'));
   if (!project.sourceConnectorId || !project.destConnectorId) {
@@ -31,10 +47,11 @@ migrationsApi.post('/:projectId/start', async (c) => {
   if (passType !== 'assessment' && workloads.length === 0) {
     throw new ApiError(400, 'select at least one workload');
   }
-  if (passType === 'prestage' && !body.filters?.mailReceivedBefore) {
+  const filters = normalizeFilters(body.filters);
+  if (passType === 'prestage' && !filters.mailReceivedBefore) {
     throw new ApiError(400, 'prestage requires filters.mailReceivedBefore (the cutoff date)');
   }
-  const pass: PassConfig = { passType, workloads, filters: body.filters ?? {} };
+  const pass: PassConfig = { passType, workloads, filters };
 
   // Explicit userIds are intersected with this project's users: an id from
   // another project must never be started under this project's connectors.

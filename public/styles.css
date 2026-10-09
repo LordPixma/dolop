@@ -37,6 +37,11 @@ a:hover { text-decoration: underline; }
 .topbar nav { display: flex; gap: 1.2rem; }
 .topbar nav a { color: var(--muted); font-size: 0.9rem; }
 .topbar nav a:hover { color: var(--text); text-decoration: none; }
+.topbar nav { align-items: center; }
+.ws-name { color: var(--muted); font-size: 0.78rem; border: 1px solid var(--border); border-radius: 999px; padding: 0.05rem 0.65rem; }
+.ws-name:empty { display: none; }
+ol.steps { padding-left: 1.2rem; margin: 0.4rem 0 0.8rem; }
+ol.steps li { margin: 0.45rem 0; }
 
 main { max-width: 1180px; margin: 0 auto; padding: 1.6rem 1.4rem 4rem; }
 .loading { color: var(--muted); padding: 3rem; text-align: center; }

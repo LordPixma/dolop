@@ -126,3 +126,8 @@ export function timingSafeEqual(a: string, b: string): boolean {
 export function clamp(n: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, n));
 }
+
+/** Escape text for interpolation into HTML (element content or quoted attributes). */
+export function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
+}

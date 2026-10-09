@@ -3,17 +3,17 @@
 
 import { Hono } from 'hono';
 import { listAllProjectUsers, listEvents, listItemErrors, logEvent, updateUserStatus } from '../db';
-import type { Env, PassConfig, PassType, Workload } from '../types';
+import type { AppEnv, PassConfig, PassType, Workload } from '../types';
 import { ALL_WORKLOADS } from '../types';
 import { chunkArray } from '../util';
 import { ApiError, loadProject } from './helpers';
 
-export const migrationsApi = new Hono<{ Bindings: Env }>();
+export const migrationsApi = new Hono<AppEnv>();
 
 const PASS_TYPES: PassType[] = ['assessment', 'prestage', 'full', 'delta'];
 
 migrationsApi.post('/:projectId/start', async (c) => {
-  const project = await loadProject(c.env, c.req.param('projectId'));
+  const project = await loadProject(c.env, c.var.workspaceId, c.req.param('projectId'));
   if (!project.sourceConnectorId || !project.destConnectorId) {
     throw new ApiError(400, 'assign source and destination connectors to the project first');
   }
@@ -36,11 +36,13 @@ migrationsApi.post('/:projectId/start', async (c) => {
   }
   const pass: PassConfig = { passType, workloads, filters: body.filters ?? {} };
 
-  let userIds = body.userIds;
-  if (!userIds?.length) {
-    const users = await listAllProjectUsers(c.env.DB, project.id);
-    userIds = users.filter((u) => u.status !== 'running' && u.status !== 'queued').map((u) => u.id);
-  }
+  // Explicit userIds are intersected with this project's users: an id from
+  // another project must never be started under this project's connectors.
+  const users = await listAllProjectUsers(c.env.DB, project.id);
+  const requested = body.userIds?.length ? new Set(body.userIds) : null;
+  const userIds = users
+    .filter((u) => (requested ? requested.has(u.id) : u.status !== 'running' && u.status !== 'queued'))
+    .map((u) => u.id);
   if (userIds.length === 0) throw new ApiError(400, 'no eligible users to start');
 
   for (const id of userIds) {
@@ -57,7 +59,7 @@ migrationsApi.post('/:projectId/start', async (c) => {
 });
 
 migrationsApi.post('/:projectId/stop', async (c) => {
-  const project = await loadProject(c.env, c.req.param('projectId'));
+  const project = await loadProject(c.env, c.var.workspaceId, c.req.param('projectId'));
   const body = (await c.req.json().catch(() => ({}))) as { userIds?: string[] };
   const stub = c.env.COORDINATOR.get(c.env.COORDINATOR.idFromName(project.id));
   const res = await stub.fetch('https://do/stop', {
@@ -85,14 +87,14 @@ migrationsApi.post('/:projectId/stop', async (c) => {
 });
 
 migrationsApi.get('/:projectId/queue', async (c) => {
-  const project = await loadProject(c.env, c.req.param('projectId'));
+  const project = await loadProject(c.env, c.var.workspaceId, c.req.param('projectId'));
   const stub = c.env.COORDINATOR.get(c.env.COORDINATOR.idFromName(project.id));
   const res = await stub.fetch('https://do/status');
   return c.json(await res.json());
 });
 
 migrationsApi.get('/:projectId/errors', async (c) => {
-  const project = await loadProject(c.env, c.req.param('projectId'));
+  const project = await loadProject(c.env, c.var.workspaceId, c.req.param('projectId'));
   const result = await listItemErrors(c.env.DB, project.id, {
     userId: c.req.query('userId'),
     limit: parseInt(c.req.query('limit') ?? '100', 10),
@@ -102,6 +104,6 @@ migrationsApi.get('/:projectId/errors', async (c) => {
 });
 
 migrationsApi.get('/:projectId/events', async (c) => {
-  const project = await loadProject(c.env, c.req.param('projectId'));
+  const project = await loadProject(c.env, c.var.workspaceId, c.req.param('projectId'));
   return c.json({ events: await listEvents(c.env.DB, project.id, { limit: 200 }) });
 });

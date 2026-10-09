@@ -1,27 +1,44 @@
 // Tenant connector endpoints. A connector holds the Entra ID app registration
 // for one tenant (tenant id + client id + encrypted client secret) and can be
-// used as either side of any project.
+// used as either side of any project in the same workspace.
 
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { encryptSecret, signState } from '../crypto';
 import {
   createConnector,
   deleteConnector,
-  getConnector,
   listConnectors,
-  listProjects,
+  projectsUsingConnector,
   updateConnectorSecret,
   updateConnectorVerify,
 } from '../db';
 import { GraphAuthError, GraphClient, GraphError } from '../graph/client';
 import type { Organization } from '../graph/types';
-import type { Env } from '../types';
-import { credsForConnector } from './helpers';
+import type { AppEnv } from '../types';
+import { credsForConnector, loadConnector } from './helpers';
 
-export const connectorsApi = new Hono<{ Bindings: Env }>();
+export const connectorsApi = new Hono<AppEnv>();
+
+const CONSENT_LINK_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Signed admin-consent URL for a consent-mode connector (MT_CLIENT_ID must be set). */
+async function consentLink(
+  c: Context<AppEnv>,
+  connectorId: string
+): Promise<{ consentUrl: string; redirectUri: string }> {
+  const state = await signState({ cid: connectorId }, c.env.ENCRYPTION_KEY, CONSENT_LINK_TTL_MS);
+  const redirectUri = `${new URL(c.req.url).origin}/api/consent/callback`;
+  const consentUrl =
+    'https://login.microsoftonline.com/organizations/v2.0/adminconsent' +
+    `?client_id=${encodeURIComponent(c.env.MT_CLIENT_ID ?? '')}` +
+    `&scope=${encodeURIComponent('https://graph.microsoft.com/.default')}` +
+    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+    `&state=${encodeURIComponent(state)}`;
+  return { consentUrl, redirectUri };
+}
 
 connectorsApi.get('/', async (c) => {
-  return c.json({ connectors: await listConnectors(c.env.DB) });
+  return c.json({ connectors: await listConnectors(c.env.DB, c.var.workspaceId) });
 });
 
 connectorsApi.post('/', async (c) => {
@@ -36,6 +53,7 @@ connectorsApi.post('/', async (c) => {
   }
   const clientSecretEnc = await encryptSecret(body.clientSecret, c.env.ENCRYPTION_KEY);
   const id = await createConnector(c.env.DB, {
+    workspaceId: c.var.workspaceId,
     name: body.name,
     tenantId: body.tenantId,
     clientId: body.clientId,
@@ -63,6 +81,7 @@ connectorsApi.post('/consent-link', async (c) => {
   if (!body.name) return c.json({ error: 'name is required' }, 400);
 
   const id = await createConnector(c.env.DB, {
+    workspaceId: c.var.workspaceId,
     name: body.name,
     tenantId: '',
     clientId: c.env.MT_CLIENT_ID,
@@ -70,20 +89,11 @@ connectorsApi.post('/consent-link', async (c) => {
     authMode: 'consent',
     verifyStatus: 'pending_consent',
   });
-  const state = await signState({ cid: id }, c.env.ENCRYPTION_KEY, 7 * 24 * 60 * 60 * 1000);
-  const redirectUri = `${new URL(c.req.url).origin}/api/consent/callback`;
-  const consentUrl =
-    'https://login.microsoftonline.com/organizations/v2.0/adminconsent' +
-    `?client_id=${encodeURIComponent(c.env.MT_CLIENT_ID)}` +
-    `&scope=${encodeURIComponent('https://graph.microsoft.com/.default')}` +
-    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-    `&state=${encodeURIComponent(state)}`;
-  return c.json({ id, consentUrl, redirectUri }, 201);
+  return c.json({ id, ...(await consentLink(c, id)) }, 201);
 });
 
 connectorsApi.get('/:id', async (c) => {
-  const connector = await getConnector(c.env.DB, c.req.param('id'));
-  if (!connector) return c.json({ error: 'connector not found' }, 404);
+  const connector = await loadConnector(c.env, c.var.workspaceId, c.req.param('id'));
   const { clientSecretEnc: _omit, ...safe } = connector;
   return c.json({ connector: safe });
 });
@@ -91,28 +101,18 @@ connectorsApi.get('/:id', async (c) => {
 // Re-issue the consent link for an existing consent-mode connector (links are
 // HMAC-signed and expire after 7 days; re-consent is also harmless).
 connectorsApi.post('/:id/consent-link', async (c) => {
-  const connector = await getConnector(c.env.DB, c.req.param('id'));
-  if (!connector) return c.json({ error: 'connector not found' }, 404);
+  const connector = await loadConnector(c.env, c.var.workspaceId, c.req.param('id'));
   if (connector.authMode !== 'consent') {
     return c.json({ error: 'not a consent-mode connector' }, 400);
   }
   if (!c.env.MT_CLIENT_ID) {
     return c.json({ error: 'MT_CLIENT_ID secret is not configured' }, 422);
   }
-  const state = await signState({ cid: connector.id }, c.env.ENCRYPTION_KEY, 7 * 24 * 60 * 60 * 1000);
-  const redirectUri = `${new URL(c.req.url).origin}/api/consent/callback`;
-  const consentUrl =
-    'https://login.microsoftonline.com/organizations/v2.0/adminconsent' +
-    `?client_id=${encodeURIComponent(c.env.MT_CLIENT_ID)}` +
-    `&scope=${encodeURIComponent('https://graph.microsoft.com/.default')}` +
-    `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-    `&state=${encodeURIComponent(state)}`;
-  return c.json({ id: connector.id, consentUrl, redirectUri });
+  return c.json({ id: connector.id, ...(await consentLink(c, connector.id)) });
 });
 
 connectorsApi.patch('/:id', async (c) => {
-  const connector = await getConnector(c.env.DB, c.req.param('id'));
-  if (!connector) return c.json({ error: 'connector not found' }, 404);
+  const connector = await loadConnector(c.env, c.var.workspaceId, c.req.param('id'));
   if (connector.authMode === 'consent') {
     return c.json(
       { error: 'consent connectors have no per-connector secret — rotate the MT_CLIENT_SECRET Worker secret instead' },
@@ -130,23 +130,18 @@ connectorsApi.patch('/:id', async (c) => {
 });
 
 connectorsApi.delete('/:id', async (c) => {
-  const id = c.req.param('id');
-  const projects = await listProjects(c.env.DB);
-  const used = projects.filter((p) => p.sourceConnectorId === id || p.destConnectorId === id);
+  const connector = await loadConnector(c.env, c.var.workspaceId, c.req.param('id'));
+  const used = await projectsUsingConnector(c.env.DB, connector.id);
   if (used.length > 0) {
-    return c.json(
-      { error: `connector is used by project(s): ${used.map((p) => p.name).join(', ')}` },
-      409
-    );
+    return c.json({ error: `connector is used by project(s): ${used.join(', ')}` }, 409);
   }
-  await deleteConnector(c.env.DB, id);
+  await deleteConnector(c.env.DB, connector.id);
   return c.json({ ok: true });
 });
 
 // Verifies credentials and core Graph permissions; records the result.
 connectorsApi.post('/:id/verify', async (c) => {
-  const connector = await getConnector(c.env.DB, c.req.param('id'));
-  if (!connector) return c.json({ error: 'connector not found' }, 404);
+  const connector = await loadConnector(c.env, c.var.workspaceId, c.req.param('id'));
   if (connector.authMode === 'consent' && !connector.tenantId) {
     return c.json(
       { ok: false, error: 'waiting for a tenant admin to approve the consent link' },

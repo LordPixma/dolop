@@ -15,11 +15,11 @@ import {
 } from '../db';
 import { GraphError } from '../graph/client';
 import type { GraphUser, SubscribedSku } from '../graph/types';
-import type { Env, MigrationUser } from '../types';
+import type { AppEnv, Env, MigrationUser } from '../types';
 import { mapUpnToDomain, parseMappingCsv } from '../util';
 import { ApiError, generatePassword, graphForConnector, loadProject } from './helpers';
 
-export const usersApi = new Hono<{ Bindings: Env }>();
+export const usersApi = new Hono<AppEnv>();
 
 /**
  * Change a user's destination UPN. The orchestrator's id map and delta cursors
@@ -86,8 +86,8 @@ async function applyMappings(
 
 // Discover users in the source tenant (optionally filtered with an OData $filter).
 usersApi.post('/:projectId/discover', async (c) => {
-  const project = await loadProject(c.env, c.req.param('projectId'));
-  const { client } = await graphForConnector(c.env, project.sourceConnectorId, 'source');
+  const project = await loadProject(c.env, c.var.workspaceId, c.req.param('projectId'));
+  const { client } = await graphForConnector(c.env, project, 'source');
   const body = (await c.req.json().catch(() => ({}))) as { filter?: string };
 
   const select = '$select=id,userPrincipalName,displayName,mail,accountEnabled,assignedLicenses';
@@ -115,7 +115,7 @@ usersApi.post('/:projectId/discover', async (c) => {
 
 // Add users to the project scope.
 usersApi.post('/:projectId/users', async (c) => {
-  const project = await loadProject(c.env, c.req.param('projectId'));
+  const project = await loadProject(c.env, c.var.workspaceId, c.req.param('projectId'));
   const body = (await c.req.json().catch(() => ({}))) as {
     mappings?: { sourceUpn: string; destUpn: string; displayName?: string; sourceId?: string }[];
     autoMap?: {
@@ -144,7 +144,7 @@ usersApi.post('/:projectId/users', async (c) => {
 
 // CSV import: "sourceUpn,destUpn" per line (optional header).
 usersApi.post('/:projectId/users/import', async (c) => {
-  const project = await loadProject(c.env, c.req.param('projectId'));
+  const project = await loadProject(c.env, c.var.workspaceId, c.req.param('projectId'));
   const text = await c.req.text();
   const { rows, errors } = parseMappingCsv(text);
   if (rows.length === 0) {
@@ -157,7 +157,7 @@ usersApi.post('/:projectId/users/import', async (c) => {
 // Edit a user's mapping. Changing destUpn resets that user's migration state
 // (id map + delta cursors) so the next pass fully re-copies to the new mailbox.
 usersApi.patch('/:projectId/users/:userId', async (c) => {
-  const project = await loadProject(c.env, c.req.param('projectId'));
+  const project = await loadProject(c.env, c.var.workspaceId, c.req.param('projectId'));
   const user = await getUser(c.env.DB, c.req.param('userId'));
   if (!user || user.projectId !== project.id) throw new ApiError(404, 'user not found');
   const body = (await c.req.json().catch(() => ({}))) as { destUpn?: string; displayName?: string };
@@ -179,7 +179,7 @@ usersApi.patch('/:projectId/users/:userId', async (c) => {
 });
 
 usersApi.get('/:projectId/users', async (c) => {
-  const project = await loadProject(c.env, c.req.param('projectId'));
+  const project = await loadProject(c.env, c.var.workspaceId, c.req.param('projectId'));
   const result = await listUsers(c.env.DB, project.id, {
     status: c.req.query('status'),
     limit: parseInt(c.req.query('limit') ?? '100', 10),
@@ -189,7 +189,7 @@ usersApi.get('/:projectId/users', async (c) => {
 });
 
 usersApi.get('/:projectId/users/:userId', async (c) => {
-  const project = await loadProject(c.env, c.req.param('projectId'));
+  const project = await loadProject(c.env, c.var.workspaceId, c.req.param('projectId'));
   const user = await getUser(c.env.DB, c.req.param('userId'));
   if (!user || user.projectId !== project.id) throw new ApiError(404, 'user not found');
   const { errors } = await listItemErrors(c.env.DB, project.id, { userId: user.id, limit: 50 });
@@ -197,7 +197,7 @@ usersApi.get('/:projectId/users/:userId', async (c) => {
 });
 
 usersApi.delete('/:projectId/users/:userId', async (c) => {
-  const project = await loadProject(c.env, c.req.param('projectId'));
+  const project = await loadProject(c.env, c.var.workspaceId, c.req.param('projectId'));
   const user = await getUser(c.env.DB, c.req.param('userId'));
   if (!user || user.projectId !== project.id) throw new ApiError(404, 'user not found');
   if (user.status === 'running' || user.status === 'queued') {
@@ -211,7 +211,7 @@ usersApi.delete('/:projectId/users/:userId', async (c) => {
 // mapping. The next full pass re-copies everything — combine with the
 // mailDedupeByMessageId pass option to converge instead of duplicating.
 usersApi.post('/:projectId/users/:userId/reset', async (c) => {
-  const project = await loadProject(c.env, c.req.param('projectId'));
+  const project = await loadProject(c.env, c.var.workspaceId, c.req.param('projectId'));
   const user = await getUser(c.env.DB, c.req.param('userId'));
   if (!user || user.projectId !== project.id) throw new ApiError(404, 'user not found');
   if (user.status === 'running' || user.status === 'queued') {
@@ -240,8 +240,8 @@ usersApi.post('/:projectId/users/:userId/reset', async (c) => {
 
 // Destination tenant license SKUs (for provisioning).
 usersApi.get('/:projectId/skus', async (c) => {
-  const project = await loadProject(c.env, c.req.param('projectId'));
-  const { client } = await graphForConnector(c.env, project.destConnectorId, 'destination');
+  const project = await loadProject(c.env, c.var.workspaceId, c.req.param('projectId'));
+  const { client } = await graphForConnector(c.env, project, 'destination');
   const res = await client.get<{ value: SubscribedSku[] }>(
     '/subscribedSkus?$select=skuId,skuPartNumber,consumedUnits,prepaidUnits'
   );
@@ -258,8 +258,8 @@ usersApi.get('/:projectId/skus', async (c) => {
 // Provision destination accounts (bulk). Returns one-time passwords — they are
 // shown once and never stored.
 usersApi.post('/:projectId/provision', async (c) => {
-  const project = await loadProject(c.env, c.req.param('projectId'));
-  const { client } = await graphForConnector(c.env, project.destConnectorId, 'destination');
+  const project = await loadProject(c.env, c.var.workspaceId, c.req.param('projectId'));
+  const { client } = await graphForConnector(c.env, project, 'destination');
   const body = (await c.req.json().catch(() => ({}))) as {
     userIds?: string[];
     usageLocation?: string;

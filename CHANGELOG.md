@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **Workspaces, sign-up and invites**: accounts, connectors and projects now belong to
+  isolated workspaces (existing data moves into a default workspace — migration
+  `0006_workspaces.sql`). New users can join a team through single-use **invite links**
+  (Account → Invite teammate) or, when `REGISTRATION_MODE=open`, **sign up** for their own
+  workspace from the sign-in page. API-token requests act on the default workspace or the
+  one named in `X-Dolop-Workspace`.
+- **Security**: the public consent callback escaped none of Microsoft's error text
+  (reflected XSS) — fixed; consent binding now refuses a tenant owned by another
+  workspace and, with multiple workspaces, verifies the tenant through an OIDC sign-in;
+  starting a pass with `userIds` from another project is no longer possible; project
+  settings are validated and clamped server-side.
+
 - **Mail coexistence (dual-delivery)**: optionally keep both tenants' mailboxes fed during the
   migration overlap window. Dolop manages a single forwarding inbox rule per mailbox that
   forwards a copy of incoming mail to the user's counterpart in the other tenant, so mail to

@@ -1,5 +1,7 @@
 // Shared domain types and Worker environment bindings.
 
+import type { Account } from './accounts';
+
 export interface Env {
   DB: D1Database;
   KV: KVNamespace;
@@ -19,6 +21,23 @@ export interface Env {
    */
   MT_CLIENT_ID?: string;
   MT_CLIENT_SECRET?: string;
+  /**
+   * Self-service sign-up (wrangler var). 'open': anyone can register a new,
+   * isolated workspace from the sign-in page. Anything else (default
+   * 'closed'): only first-run setup and team invite links create accounts.
+   */
+  REGISTRATION_MODE?: string;
+}
+
+/** Hono context for authenticated API routes (populated by requireAuth). */
+export interface AppEnv {
+  Bindings: Env;
+  Variables: {
+    /** The workspace every query in this request is scoped to. */
+    workspaceId: string;
+    /** The signed-in operator, or null when authenticated with API_TOKEN. */
+    account: Account | null;
+  };
 }
 
 export type Workload = 'mail' | 'calendar' | 'contacts' | 'tasks' | 'drive' | 'rules';
@@ -128,6 +147,7 @@ export interface UserActivity {
 
 export interface Connector {
   id: string;
+  workspaceId: string;
   name: string;
   tenantId: string;
   clientId: string;
@@ -147,6 +167,7 @@ export interface Connector {
 
 export interface Project {
   id: string;
+  workspaceId: string;
   name: string;
   description?: string;
   sourceConnectorId?: string;

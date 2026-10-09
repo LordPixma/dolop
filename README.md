@@ -31,6 +31,7 @@ with delta passes, then cut over with minimal user disruption.
 | **Provisioning** | Create destination accounts in bulk with one-time passwords and license assignment (SKU picker) |
 | **Assessment** | Pre-migration sizing (mailbox item counts, OneDrive usage) and destination readiness checks — writes nothing |
 | **Tenant onboarding** | BitTitan-style **admin consent links**: one multi-tenant app, a Global Admin clicks approve, the connector binds itself — or manual per-tenant app registrations if preferred |
+| **Accounts & workspaces** | Each account belongs to an isolated workspace (its own connectors, projects and team). Teammates join via single-use **invite links**; optional **self-service sign-up** lets new users register their own workspace for their migration |
 
 ### The migration model
 
@@ -101,7 +102,10 @@ npm run deploy
 
 Open the deployed URL — the first visit walks you through creating the initial
 **administrator account** (username/password; PBKDF2-hashed, HttpOnly session cookies, login
-rate-limiting). Then connect your tenants — with **admin consent links** (recommended; see
+rate-limiting). Invite teammates from **Account → Invite teammate**, or set
+`REGISTRATION_MODE` to `open` in `wrangler.jsonc` to let new users sign up for their own
+isolated workspace (see [Accounts, workspaces and sign-up](docs/setup.md#6-accounts-workspaces-and-sign-up)).
+Then connect your tenants — with **admin consent links** (recommended; see
 Option A in [docs/setup.md](docs/setup.md)) or manual per-tenant app registrations — create
 a project, and follow the [M&A runbook](docs/runbook.md).
 
@@ -127,7 +131,8 @@ migrations, ensures queues exist, and syncs optional `DOLOP_*` secrets).
 
 Tenant secrets are AES-256-GCM encrypted at rest with a key that exists only as a Worker
 secret; Graph access is app-only (no user credentials ever collected); operator passwords
-are PBKDF2-hashed; sessions are HttpOnly cookies storing only a hash server-side. Hardening
+are PBKDF2-hashed; sessions are HttpOnly cookies storing only a hash server-side; every API
+lookup is scoped to the caller's workspace. Hardening
 guidance (Cloudflare Access, Exchange application access policies) is in
 [SECURITY.md](SECURITY.md) — which is also where to report vulnerabilities.
 

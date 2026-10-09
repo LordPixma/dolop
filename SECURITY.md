@@ -20,6 +20,9 @@ before public disclosure.
 | Operator passwords | PBKDF2-SHA256 (100k iterations, per-password salt) |
 | Sessions | 256-bit random token in an HttpOnly/Secure/SameSite=Lax cookie; only the SHA-256 of the token is stored server-side |
 | Login | Per-username rate limiting (10 failures → 15-minute lockout) |
+| Workspace isolation | Every account, connector and project belongs to one workspace; all API lookups are scoped to the caller's workspace and ids from other workspaces return 404 |
+| Registration | Self-service sign-up is off unless `REGISTRATION_MODE=open`, only possible after first-run setup, and rate-limited per IP; team invites are single-use, expire after 7 days, and only the token's SHA-256 is stored |
+| Consent tenant binding | A tenant can be bound by consent in only one workspace; with multiple workspaces the tenant id must come from a Microsoft-issued ID token (OIDC sign-in), not the unsigned redirect parameter |
 | Admin consent flow | HMAC-SHA256-signed, expiring state parameter on the public callback |
 | Mailbox data | Streams through the Worker per-request; not persisted (metadata, stats and item-error descriptions only) |
 
@@ -30,6 +33,9 @@ before public disclosure.
 2. Scope mailbox access with an **Exchange application access policy**
    (`New-ApplicationAccessPolicy`) so the app can only reach in-scope mailboxes.
 3. Set `ENCRYPTION_KEY` once, store it in a password manager, never reuse it elsewhere.
-4. Treat `API_TOKEN` like a root credential; rotate it after engagements.
-5. Use a dedicated Cloudflare API token (Workers/Queues/D1 edit only) for CI, and delete
+4. Treat `API_TOKEN` like a root credential (it can act on any workspace via
+   `X-Dolop-Workspace`); rotate it after engagements.
+5. Keep `REGISTRATION_MODE` closed unless you intend to run dolop as a shared service;
+   prefer invite links for adding teammates.
+6. Use a dedicated Cloudflare API token (Workers/Queues/D1 edit only) for CI, and delete
    tenant connectors + revoke enterprise-app consent when a migration project ends.

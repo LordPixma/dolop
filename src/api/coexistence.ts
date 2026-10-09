@@ -19,6 +19,7 @@ import {
 } from '../engine/coexistence';
 import { GraphClient, GraphError } from '../graph/client';
 import type {
+  AppEnv,
   CoexistenceDirection,
   CoexistenceForwardMode,
   Env,
@@ -26,7 +27,7 @@ import type {
 } from '../types';
 import { ApiError, graphForConnector, loadProject } from './helpers';
 
-export const coexistenceApi = new Hono<{ Bindings: Env }>();
+export const coexistenceApi = new Hono<AppEnv>();
 
 // Bound the number of mailboxes touched per request to stay well inside the
 // Worker subrequest budget (each enable is a handful of Graph calls). The
@@ -67,15 +68,16 @@ function errMessage(e: unknown): string {
 /** Load source + destination Graph clients for the project (both required). */
 async function projectClients(
   env: Env,
+  workspaceId: string,
   projectId: string
 ): Promise<{ src: GraphClient; dst: GraphClient }> {
-  const project = await loadProject(env, projectId);
+  const project = await loadProject(env, workspaceId, projectId);
   if (!project.sourceConnectorId || !project.destConnectorId) {
     throw new ApiError(400, 'assign source and destination connectors to the project first');
   }
   const [{ client: src }, { client: dst }] = await Promise.all([
-    graphForConnector(env, project.sourceConnectorId, 'source'),
-    graphForConnector(env, project.destConnectorId, 'destination'),
+    graphForConnector(env, project, 'source'),
+    graphForConnector(env, project, 'destination'),
   ]);
   return { src, dst };
 }
@@ -95,7 +97,7 @@ async function targetUsers(
 
 // Current coexistence rollup for the dashboard.
 coexistenceApi.get('/:projectId/coexistence', async (c) => {
-  const project = await loadProject(c.env, c.req.param('projectId'));
+  const project = await loadProject(c.env, c.var.workspaceId, c.req.param('projectId'));
   return c.json({ summary: await coexistenceSummary(c.env.DB, project.id) });
 });
 
@@ -113,7 +115,7 @@ coexistenceApi.post('/:projectId/coexistence/enable', async (c) => {
   }
   const forwardMode: CoexistenceForwardMode = body.forwardMode === 'upn' ? 'upn' : 'routing';
 
-  const { src, dst } = await projectClients(c.env, projectId);
+  const { src, dst } = await projectClients(c.env, c.var.workspaceId, projectId);
   const users = await targetUsers(c.env, projectId, body.userIds);
 
   const results: {
@@ -177,7 +179,7 @@ coexistenceApi.post('/:projectId/coexistence/disable', async (c) => {
   const projectId = c.req.param('projectId');
   const body = (await c.req.json().catch(() => ({}))) as { userIds?: string[] };
 
-  const { src, dst } = await projectClients(c.env, projectId);
+  const { src, dst } = await projectClients(c.env, c.var.workspaceId, projectId);
   const users = (await targetUsers(c.env, projectId, body.userIds)).filter(
     (u) => u.coexistenceStatus !== 'off' || u.coexistenceRuleId
   );

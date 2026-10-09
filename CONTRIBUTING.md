@@ -38,8 +38,10 @@ src/accounts.ts       Operator accounts, password hashing, sessions
 src/crypto.ts         AES-GCM secret encryption, HMAC-signed consent state
 migrations/           D1 schema migrations
 public/               Dependency-free dashboard SPA
-test/                 Vitest unit tests for pure logic, plus API integration tests
-                      (test/support: node:sqlite-backed D1 running the real migrations)
+test/                 Vitest unit tests for pure logic, API integration tests
+                      (node:sqlite-backed D1 running the real migrations) and engine
+                      tests (real engines + GraphClient against a fake Graph; see
+                      test/support)
 docs/                 Setup, runbook, architecture, FAQ, parity
 ```
 

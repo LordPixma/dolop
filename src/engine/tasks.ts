@@ -6,6 +6,7 @@
 
 import { GraphError } from '../graph/client';
 import type { TodoTask, TodoTaskList } from '../graph/types';
+import { drainPages } from './paged';
 import { buildTaskPayload } from './transform';
 import type { MigrationContext, StepResult, WorkloadEngine } from './workload';
 
@@ -94,74 +95,68 @@ export class TasksEngine implements WorkloadEngine {
   }
 
   private async items(ctx: MigrationContext): Promise<StepResult> {
-    const { store, source, dest, report } = ctx;
+    const { store } = ctx;
     while (!ctx.budget.exhausted) {
       const work = store.peekWork<ScanWork>(W, 'scan');
       if (!work) return 'done';
       const scan = work.payload;
-
-      const url =
-        store.getState<string>(W, `next:${scan.srcListId}`) ??
-        `${ctx.sourceUserPath}/todo/lists/${scan.srcListId}/tasks?$expand=checklistItems&$top=25`;
-      const page = await source.page<TodoTask>(url, 25);
-
-      for (const task of page.items) {
-        if (ctx.budget.exhausted) break;
-        report.stat(W, 'discovered');
-        if (store.mapGet(W, 'item', task.id)) {
-          report.stat(W, 'skipped');
-          ctx.budget.itemDone();
-          continue;
-        }
-        try {
-          const created = await dest.post<{ id: string }>(
-            `${ctx.destUserPath}/todo/lists/${scan.destListId}/tasks`,
-            buildTaskPayload(task)
-          );
-          for (const item of task.checklistItems ?? []) {
-            await dest
-              .post(`${ctx.destUserPath}/todo/lists/${scan.destListId}/tasks/${created.id}/checklistItems`, {
-                displayName: item.displayName ?? '',
-                isChecked: item.isChecked ?? false,
-              })
-              .catch(() => {
-                report.itemError(W, {
-                  itemType: 'checklistItem',
-                  itemId: task.id,
-                  itemName: task.title,
-                  code: 'checklist_failed',
-                  message: 'task migrated but a checklist item failed to copy',
-                });
-              });
-          }
-          store.mapPut(W, 'item', task.id, created.id);
-          report.stat(W, 'migrated');
-          ctx.budget.itemDone();
-        } catch (e) {
-          if (e instanceof GraphError && e.name !== 'GraphThrottleError' && e.status !== 403) {
-            report.itemError(W, {
-              itemType: 'task',
-              itemId: task.id,
-              itemName: task.title,
-              code: e.code,
-              message: e.message,
-            });
-            report.stat(W, 'failed');
-            store.mapPut(W, 'item', task.id, 'failed');
-            ctx.budget.itemDone();
-            continue;
-          }
-          throw e;
-        }
-      }
-
-      if (page.nextLink) {
-        store.setState(W, `next:${scan.srcListId}`, page.nextLink);
-      } else {
-        store.delState(W, `next:${scan.srcListId}`);
-        store.popWork(work.id);
-      }
+      const finished = await drainPages<TodoTask>(
+        ctx,
+        W,
+        {
+          key: scan.srcListId,
+          firstUrl: `${ctx.sourceUserPath}/todo/lists/${scan.srcListId}/tasks?$expand=checklistItems&$top=25`,
+          pageSize: 25,
+        },
+        (task) => this.copyTask(ctx, scan, task)
+      );
+      if (finished) store.popWork(work.id);
     }
     return 'continue';
+  }
+
+  private async copyTask(ctx: MigrationContext, scan: ScanWork, task: TodoTask): Promise<void> {
+    const { store, dest, report } = ctx;
+    report.stat(W, 'discovered');
+    if (store.mapGet(W, 'item', task.id)) {
+      report.stat(W, 'skipped'); // no Graph call, so it doesn't count against the tick's item budget
+      return;
+    }
+    try {
+      const created = await dest.post<{ id: string }>(
+        `${ctx.destUserPath}/todo/lists/${scan.destListId}/tasks`,
+        buildTaskPayload(task)
+      );
+      for (const item of task.checklistItems ?? []) {
+        await dest
+          .post(`${ctx.destUserPath}/todo/lists/${scan.destListId}/tasks/${created.id}/checklistItems`, {
+            displayName: item.displayName ?? '',
+            isChecked: item.isChecked ?? false,
+          })
+          .catch(() => {
+            report.itemError(W, {
+              itemType: 'checklistItem',
+              itemId: task.id,
+              itemName: task.title,
+              code: 'checklist_failed',
+              message: 'task migrated but a checklist item failed to copy',
+            });
+          });
+      }
+      store.mapPut(W, 'item', task.id, created.id);
+      report.stat(W, 'migrated');
+    } catch (e) {
+      if (!(e instanceof GraphError) || e.name === 'GraphThrottleError' || e.status === 403) throw e;
+      report.itemError(W, {
+        itemType: 'task',
+        itemId: task.id,
+        itemName: task.title,
+        code: e.code,
+        message: e.message,
+      });
+      report.stat(W, 'failed');
+      store.mapPut(W, 'item', task.id, 'failed');
+    }
+    ctx.budget.itemDone();
   }
 }

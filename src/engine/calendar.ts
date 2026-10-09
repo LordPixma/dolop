@@ -9,6 +9,7 @@
 
 import { GraphError } from '../graph/client';
 import type { GraphCalendar, GraphEvent } from '../graph/types';
+import { drainPages } from './paged';
 import { buildEventPayload } from './transform';
 import type { MigrationContext, StepResult, WorkloadEngine } from './workload';
 
@@ -81,80 +82,74 @@ export class CalendarEngine implements WorkloadEngine {
   }
 
   private async items(ctx: MigrationContext): Promise<StepResult> {
-    const { store, source, dest, report } = ctx;
+    const { store } = ctx;
     while (!ctx.budget.exhausted) {
       const work = store.peekWork<ScanWork>(W, 'scan');
       if (!work) return 'done';
       const scan = work.payload;
-
-      const url =
-        store.getState<string>(W, `next:${scan.srcCalId}`) ??
-        `${ctx.sourceUserPath}/calendars/${scan.srcCalId}/events?${EVENT_SELECT}`;
-      const page = await source.page<GraphEvent>(url, 25);
-
-      for (const ev of page.items) {
-        if (ctx.budget.exhausted) break;
-        if (ev.isCancelled || ev.type === 'occurrence' || ev.type === 'exception') continue;
-        report.stat(W, 'discovered');
-        if (store.mapGet(W, 'item', ev.id)) {
-          report.stat(W, 'skipped');
-          ctx.budget.itemDone();
-          continue;
-        }
-        try {
-          const { payload, strippedAttendees } = buildEventPayload(ev, {
-            attendeeMode: ctx.pass.filters.calendarAttendees ?? 'strip',
-          });
-          const created = await dest.post<{ id: string }>(
-            `${ctx.destUserPath}/calendars/${scan.destCalId}/events`,
-            payload
-          );
-          if (strippedAttendees) {
-            await dest
-              .post(`${ctx.destUserPath}/events/${created.id}/extensions`, {
-                '@odata.type': 'microsoft.graph.openTypeExtension',
-                extensionName: 'com.dolop.migration',
-                originalAttendees: JSON.stringify(strippedAttendees).slice(0, 30_000),
-                originalOrganizer: JSON.stringify(ev.organizer ?? null),
-              })
-              .catch(() => {
-                report.itemError(W, {
-                  itemType: 'event-extension',
-                  itemId: ev.id,
-                  itemName: ev.subject,
-                  code: 'extension_failed',
-                  message: 'event migrated but original attendee list could not be stored',
-                });
-              });
-          }
-          store.mapPut(W, 'item', ev.id, created.id);
-          report.stat(W, 'migrated');
-          ctx.budget.itemDone();
-        } catch (e) {
-          if (e instanceof GraphError && e.name !== 'GraphThrottleError') {
-            report.itemError(W, {
-              itemType: 'event',
-              itemId: ev.id,
-              itemName: ev.subject,
-              code: e.code,
-              message: e.message,
-            });
-            report.stat(W, 'failed');
-            store.mapPut(W, 'item', ev.id, 'failed'); // don't retry forever within this pass
-            ctx.budget.itemDone();
-            continue;
-          }
-          throw e;
-        }
-      }
-
-      if (page.nextLink) {
-        store.setState(W, `next:${scan.srcCalId}`, page.nextLink);
-      } else {
-        store.delState(W, `next:${scan.srcCalId}`);
-        store.popWork(work.id);
-      }
+      const finished = await drainPages<GraphEvent>(
+        ctx,
+        W,
+        {
+          key: scan.srcCalId,
+          firstUrl: `${ctx.sourceUserPath}/calendars/${scan.srcCalId}/events?${EVENT_SELECT}`,
+          pageSize: 25,
+        },
+        (ev) => this.copyEvent(ctx, scan, ev)
+      );
+      if (finished) store.popWork(work.id);
     }
     return 'continue';
+  }
+
+  private async copyEvent(ctx: MigrationContext, scan: ScanWork, ev: GraphEvent): Promise<void> {
+    const { store, dest, report } = ctx;
+    if (ev.isCancelled || ev.type === 'occurrence' || ev.type === 'exception') return;
+    report.stat(W, 'discovered');
+    if (store.mapGet(W, 'item', ev.id)) {
+      report.stat(W, 'skipped'); // no Graph call, so it doesn't count against the tick's item budget
+      return;
+    }
+    try {
+      const { payload, strippedAttendees } = buildEventPayload(ev, {
+        attendeeMode: ctx.pass.filters.calendarAttendees ?? 'strip',
+      });
+      const created = await dest.post<{ id: string }>(
+        `${ctx.destUserPath}/calendars/${scan.destCalId}/events`,
+        payload
+      );
+      if (strippedAttendees) {
+        await dest
+          .post(`${ctx.destUserPath}/events/${created.id}/extensions`, {
+            '@odata.type': 'microsoft.graph.openTypeExtension',
+            extensionName: 'com.dolop.migration',
+            originalAttendees: JSON.stringify(strippedAttendees).slice(0, 30_000),
+            originalOrganizer: JSON.stringify(ev.organizer ?? null),
+          })
+          .catch(() => {
+            report.itemError(W, {
+              itemType: 'event-extension',
+              itemId: ev.id,
+              itemName: ev.subject,
+              code: 'extension_failed',
+              message: 'event migrated but original attendee list could not be stored',
+            });
+          });
+      }
+      store.mapPut(W, 'item', ev.id, created.id);
+      report.stat(W, 'migrated');
+    } catch (e) {
+      if (!(e instanceof GraphError) || e.name === 'GraphThrottleError') throw e;
+      report.itemError(W, {
+        itemType: 'event',
+        itemId: ev.id,
+        itemName: ev.subject,
+        code: e.code,
+        message: e.message,
+      });
+      report.stat(W, 'failed');
+      store.mapPut(W, 'item', ev.id, 'failed'); // don't retry forever within this pass
+    }
+    ctx.budget.itemDone();
   }
 }

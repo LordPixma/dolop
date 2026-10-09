@@ -36,6 +36,10 @@ at most one tick of repeated work.
 - `kv` — `phase:*` and `state:*` keys (reset every pass) plus `cursor:*` keys
   (**persist across passes**: mail per-folder delta links keyed by filter signature,
   the OneDrive delta token).
+- **Paged item workloads** (contacts, calendar, To Do) record their position *within* a
+  page — page URL, items handled, last item id — after every item, so a tick that runs out
+  of budget mid-page resumes at the next item. Id-map skips make no Graph call and don't
+  count against the tick's item budget.
 - `idmap` — source id → destination id per workload. This is the idempotency backbone:
   pre-stage → full → delta sequences never duplicate an item.
 - `work` — durable work queue (folder scans, pending file copies), drained across ticks.

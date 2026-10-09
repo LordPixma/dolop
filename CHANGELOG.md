@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Fixed: contacts, calendar events and To Do tasks could be silently skipped.** When a
+  tick's budget ran out part-way through a Graph page (always, for contacts: 50-item pages
+  vs. a 25-item budget), the rest of that page was never migrated and no error was logged.
+  These workloads now resume mid-page. Items missed by earlier passes are picked up by the
+  next pass of any type. Re-walking already-migrated items is also much faster.
+
 - **Workspaces, sign-up and invites**: accounts, connectors and projects now belong to
   isolated workspaces (existing data moves into a default workspace — migration
   `0006_workspaces.sql`). New users can join a team through single-use **invite links**

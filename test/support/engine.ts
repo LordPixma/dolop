@@ -37,6 +37,7 @@ export interface FakeRequest {
   raw: ArrayBuffer | null;
   /** Regex capture groups from the matched route. */
   m: RegExpMatchArray;
+  signal?: AbortSignal;
 }
 
 type Handler = (req: FakeRequest) => Response | Promise<Response>;
@@ -66,9 +67,6 @@ export class FakeGraph {
   readonly fetch = async (input: string | URL | Request, init: RequestInit = {}): Promise<Response> => {
     const url = new URL(input instanceof Request ? input.url : String(input));
     const method = (init.method ?? 'GET').toUpperCase();
-    if (url.host === 'login.microsoftonline.com') {
-      return json({ access_token: 'token', expires_in: 3600 });
-    }
     // Graph paths are matched without the /v1.0 prefix.
     const target = url.host === 'graph.microsoft.com' ? url.pathname.replace(/^\/v1\.0/, '') : `${url.host}${url.pathname}`;
     this.log.push(`${method} ${target}`);
@@ -87,10 +85,15 @@ export class FakeGraph {
       let body: unknown;
       if (init.body instanceof Uint8Array || init.body instanceof ArrayBuffer) {
         raw = init.body instanceof Uint8Array ? init.body.slice().buffer : init.body;
+      } else if (init.body instanceof URLSearchParams) {
+        body = Object.fromEntries(init.body);
       } else if (typeof init.body === 'string') {
         body = JSON.parse(init.body);
       }
-      return r.handler({ method, url, headers: new Headers(init.headers), body, raw, m });
+      return r.handler({ method, url, headers: new Headers(init.headers), body, raw, m, signal: init.signal ?? undefined });
+    }
+    if (url.host === 'login.microsoftonline.com') {
+      return json({ access_token: 'token', expires_in: 3600 });
     }
     return json({ error: { code: 'itemNotFound', message: `no fake route for ${method} ${target}` } }, 404);
   };

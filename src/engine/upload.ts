@@ -2,7 +2,7 @@
 // per Graph docs no Authorization header may be attached, so this bypasses
 // GraphClient deliberately.
 
-import { GraphError, GraphThrottleError } from '../graph/client';
+import { fetchWithTimeout, GraphError, GraphThrottleError, TRANSFER_TIMEOUT_MS } from '../graph/client';
 
 export interface ChunkResult {
   done: boolean;
@@ -17,11 +17,11 @@ export async function putUploadChunk(
   end: number,
   total: number
 ): Promise<ChunkResult> {
-  const res = await fetch(sessionUrl, {
-    method: 'PUT',
-    headers: { 'content-range': `bytes ${start}-${end}/${total}` },
-    body: bytes,
-  });
+  const res = await fetchWithTimeout(
+    sessionUrl,
+    { method: 'PUT', headers: { 'content-range': `bytes ${start}-${end}/${total}` }, body: bytes },
+    TRANSFER_TIMEOUT_MS
+  );
   if (res.status === 200 || res.status === 201) {
     const item = (await res.json().catch(() => undefined)) as Record<string, unknown> | undefined;
     return { done: true, item };

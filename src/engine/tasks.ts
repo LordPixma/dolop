@@ -18,6 +18,14 @@ interface ScanWork {
   name: string;
 }
 
+/** A created task whose checklist is part-way copied (e.g. paused by throttling). */
+interface ChecklistResume {
+  srcTaskId: string;
+  destTaskId: string;
+  /** Checklist items already handled. */
+  done: number;
+}
+
 export class TasksEngine implements WorkloadEngine {
   readonly name = 'tasks';
 
@@ -117,6 +125,13 @@ export class TasksEngine implements WorkloadEngine {
 
   private async copyTask(ctx: MigrationContext, scan: ScanWork, task: TodoTask): Promise<void> {
     const { store, dest, report } = ctx;
+    const resume = store.getCarry<ChecklistResume>(W, 'checklist');
+    if (resume?.srcTaskId === task.id) {
+      await this.copyChecklist(ctx, scan, task, resume);
+      report.stat(W, 'migrated');
+      ctx.budget.itemDone();
+      return;
+    }
     report.stat(W, 'discovered');
     if (store.mapGet(W, 'item', task.id)) {
       report.stat(W, 'skipped'); // no Graph call, so it doesn't count against the tick's item budget
@@ -127,23 +142,14 @@ export class TasksEngine implements WorkloadEngine {
         `${ctx.destUserPath}/todo/lists/${scan.destListId}/tasks`,
         buildTaskPayload(task)
       );
-      for (const item of task.checklistItems ?? []) {
-        await dest
-          .post(`${ctx.destUserPath}/todo/lists/${scan.destListId}/tasks/${created.id}/checklistItems`, {
-            displayName: item.displayName ?? '',
-            isChecked: item.isChecked ?? false,
-          })
-          .catch(() => {
-            report.itemError(W, {
-              itemType: 'checklistItem',
-              itemId: task.id,
-              itemName: task.title,
-              code: 'checklist_failed',
-              message: 'task migrated but a checklist item failed to copy',
-            });
-          });
-      }
+      // Mapped straight away so a throttle mid-checklist resumes this task
+      // (via the carried checklist position) instead of creating it again.
       store.mapPut(W, 'item', task.id, created.id);
+      if (task.checklistItems?.length) {
+        const checklist: ChecklistResume = { srcTaskId: task.id, destTaskId: created.id, done: 0 };
+        store.setCarry(W, 'checklist', checklist);
+        await this.copyChecklist(ctx, scan, task, checklist);
+      }
       report.stat(W, 'migrated');
     } catch (e) {
       if (!(e instanceof GraphError) || e.name === 'GraphThrottleError' || e.status === 403) throw e;
@@ -158,5 +164,36 @@ export class TasksEngine implements WorkloadEngine {
       store.mapPut(W, 'item', task.id, 'failed');
     }
     ctx.budget.itemDone();
+  }
+
+  /** Copy a task's checklist from the carried position; a throttle pauses with the position saved. */
+  private async copyChecklist(
+    ctx: MigrationContext,
+    scan: ScanWork,
+    task: TodoTask,
+    resume: ChecklistResume
+  ): Promise<void> {
+    const { store, dest, report } = ctx;
+    const items = task.checklistItems ?? [];
+    for (; resume.done < items.length; resume.done++) {
+      const item = items[resume.done]!;
+      try {
+        await dest.post(
+          `${ctx.destUserPath}/todo/lists/${scan.destListId}/tasks/${resume.destTaskId}/checklistItems`,
+          { displayName: item.displayName ?? '', isChecked: item.isChecked ?? false }
+        );
+      } catch (e) {
+        if (!(e instanceof GraphError) || e.name === 'GraphThrottleError') throw e;
+        report.itemError(W, {
+          itemType: 'checklistItem',
+          itemId: task.id,
+          itemName: task.title,
+          code: e.code,
+          message: `task migrated but checklist item "${item.displayName ?? ''}" failed to copy: ${e.message}`,
+        });
+      }
+      store.setCarry(W, 'checklist', { ...resume, done: resume.done + 1 });
+    }
+    store.delCarry(W, 'checklist');
   }
 }

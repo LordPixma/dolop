@@ -136,6 +136,7 @@ export interface SrcMessage {
   receivedDateTime: string;
   body: { contentType: string; content: string };
   hasAttachments: boolean;
+  internetMessageId: string;
 }
 
 export function mailTenant(fake: FakeGraph, folders: SrcMailFolder[]) {
@@ -153,6 +154,7 @@ export function mailTenant(fake: FakeGraph, folders: SrcMailFolder[]) {
           receivedDateTime: new Date(Date.UTC(2026, 0, 1 + i)).toISOString().replace('.000', ''),
           body: { contentType: 'text', content: 'hello' },
           hasAttachments: (f.attachments?.[i] ?? 0) > 0,
+          internetMessageId: `<${id}@src.test>`,
         };
       })
     );
@@ -170,7 +172,7 @@ export function mailTenant(fake: FakeGraph, folders: SrcMailFolder[]) {
     ['d-deleteditems', { name: 'Deleted Items', parent: null }],
     ['d-drafts', { name: 'Drafts', parent: null }],
   ]);
-  const created: { id: string; folder: string; subject: string; attachments: string[] }[] = [];
+  const created: { id: string; folder: string; subject: string; internetMessageId?: string; attachments: string[] }[] = [];
   const wk = WELL_KNOWN.join('|');
   fake
     .route('GET', new RegExp(`^/users/src/mailFolders/(${wk})$`), (req) => {
@@ -215,8 +217,14 @@ export function mailTenant(fake: FakeGraph, folders: SrcMailFolder[]) {
     })
     .route('POST', /^\/users\/dst\/mailFolders\/([^/]+)\/messages$/, (req) => {
       const id = `dm${created.length}`;
-      created.push({ id, folder: req.m[1]!, subject: req.body.subject, attachments: [] });
+      created.push({ id, folder: req.m[1]!, subject: req.body.subject, internetMessageId: req.body.internetMessageId, attachments: [] });
       return json({ id }, 201);
+    })
+    // Message-ID dedupe lookup: $filter=internetMessageId eq '<…>'
+    .route('GET', /^\/users\/dst\/messages$/, (req) => {
+      const wanted = /internetMessageId eq '(.+)'/.exec(req.url.searchParams.get('$filter') ?? '')?.[1]?.replace(/''/g, "'");
+      const hits = created.filter((c) => c.internetMessageId === wanted);
+      return json({ value: hits.map((c) => ({ id: c.id, hasAttachments: c.attachments.length > 0 })) });
     })
     .route('POST', /^\/users\/dst\/messages\/([^/]+)\/attachments$/, (req) => {
       created.find((c) => c.id === req.m[1])!.attachments.push(req.body.name);

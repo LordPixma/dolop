@@ -153,6 +153,51 @@ describe('tasks engine', () => {
   });
 });
 
+describe('throttling never duplicates or drops work', () => {
+  it('mail: a throttle while listing a new message\'s attachments resumes that message', async () => {
+    const { allMessages, created } = mailbox(fake, 4, { 1: 2 });
+    fake.throttle('GET', /^\/users\/src\/messages\/[^/]+\/attachments$/);
+    const h = new EngineHarness(FULL);
+    await h.run(new MailEngine());
+    expectEachOnce(created.map((c) => c.subject), allMessages.map((m) => m.subject));
+    expect(created.find((c) => c.subject === 'Inbox 1')!.attachments).toHaveLength(2);
+  });
+
+  it('mail: a throttled Message-ID dedupe lookup pauses instead of creating a duplicate', async () => {
+    const { allMessages, created } = mailbox(fake, 6);
+    const h = new EngineHarness(FULL);
+    await h.run(new MailEngine());
+    // migration state is reset (e.g. after remapping), then re-run with dedupe on
+    h.store.wipe();
+    h.newPass({ ...FULL, filters: { mailDedupeByMessageId: true } });
+    fake.throttle('GET', /^\/users\/dst\/messages$/, { after: 2 });
+    await h.run(new MailEngine());
+    expectEachOnce(created.map((c) => c.subject), allMessages.map((m) => m.subject));
+  });
+
+  it('tasks: a throttled checklist item resumes the checklist instead of dropping it', async () => {
+    const tasks = [{ id: 't1', title: 'Task t1', checklistItems: range(3).map((j) => ({ id: `s${j}`, displayName: `Step ${j}` })) }];
+    const { created, checklist } = tasksTenant(fake, [{ id: 'l1', name: 'Tasks', isDefault: true, tasks }]);
+    fake.throttle('POST', /\/checklistItems$/, { after: 1 });
+    const h = new EngineHarness(FULL);
+    await h.run(new TasksEngine());
+    expect(created.map((t) => t.title)).toEqual(['Task t1']);
+    expectEachOnce(checklist.map((c) => c.name), ['Step 0', 'Step 1', 'Step 2']);
+    expect(h.errors).toEqual([]);
+  });
+
+  it('calendar: a throttled attendee extension is retried, not dropped', async () => {
+    const events = [event('e1', { attendees: [{ emailAddress: { address: 'x@y.test' } }] })];
+    const { created, extensions } = calendarTenant(fake, [{ id: 'c1', name: 'Calendar', isDefault: true, events }]);
+    fake.throttle('POST', /\/extensions$/);
+    const h = new EngineHarness(FULL);
+    await h.run(new CalendarEngine());
+    expect(created).toHaveLength(1);
+    expect(extensions).toHaveLength(1);
+    expect(h.errors).toEqual([]);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Delta engines: a pass that stops mid-page must not lose that page
 

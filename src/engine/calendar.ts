@@ -25,6 +25,12 @@ interface ScanWork {
   name: string;
 }
 
+/** A created event whose attendee extension is still to be written (e.g. paused by throttling). */
+interface ExtensionResume {
+  srcEventId: string;
+  destEventId: string;
+}
+
 export class CalendarEngine implements WorkloadEngine {
   readonly name = 'calendar';
 
@@ -109,6 +115,14 @@ export class CalendarEngine implements WorkloadEngine {
   private async copyEvent(ctx: MigrationContext, scan: ScanWork, ev: GraphEvent): Promise<void> {
     const { store, dest, report } = ctx;
     if (ev.isCancelled || ev.type === 'occurrence' || ev.type === 'exception') return;
+    const resume = store.getCarry<ExtensionResume>(W, 'extension');
+    if (resume?.srcEventId === ev.id) {
+      const { strippedAttendees } = buildEventPayload(ev, { attendeeMode: 'strip' });
+      await this.writeAttendeeExtension(ctx, ev, resume.destEventId, strippedAttendees ?? []);
+      report.stat(W, 'migrated');
+      ctx.budget.itemDone();
+      return;
+    }
     report.stat(W, 'discovered');
     if (store.mapGet(W, 'item', ev.id)) {
       report.stat(W, 'skipped'); // no Graph call, so it doesn't count against the tick's item budget
@@ -122,25 +136,13 @@ export class CalendarEngine implements WorkloadEngine {
         `${ctx.destUserPath}/calendars/${scan.destCalId}/events`,
         payload
       );
-      if (strippedAttendees) {
-        await dest
-          .post(`${ctx.destUserPath}/events/${created.id}/extensions`, {
-            '@odata.type': 'microsoft.graph.openTypeExtension',
-            extensionName: 'com.dolop.migration',
-            originalAttendees: JSON.stringify(strippedAttendees).slice(0, 30_000),
-            originalOrganizer: JSON.stringify(ev.organizer ?? null),
-          })
-          .catch(() => {
-            report.itemError(W, {
-              itemType: 'event-extension',
-              itemId: ev.id,
-              itemName: ev.subject,
-              code: 'extension_failed',
-              message: 'event migrated but original attendee list could not be stored',
-            });
-          });
-      }
+      // Mapped straight away so a throttle on the extension resumes this
+      // event (via the carried marker) instead of creating it again.
       store.mapPut(W, 'item', ev.id, created.id);
+      if (strippedAttendees) {
+        store.setCarry(W, 'extension', { srcEventId: ev.id, destEventId: created.id } satisfies ExtensionResume);
+        await this.writeAttendeeExtension(ctx, ev, created.id, strippedAttendees);
+      }
       report.stat(W, 'migrated');
     } catch (e) {
       if (!(e instanceof GraphError) || e.name === 'GraphThrottleError') throw e;
@@ -155,5 +157,32 @@ export class CalendarEngine implements WorkloadEngine {
       store.mapPut(W, 'item', ev.id, 'failed'); // don't retry forever within this pass
     }
     ctx.budget.itemDone();
+  }
+
+  /** Preserve the stripped attendee list on the destination event; a throttle pauses and retries. */
+  private async writeAttendeeExtension(
+    ctx: MigrationContext,
+    ev: GraphEvent,
+    destEventId: string,
+    attendees: unknown[]
+  ): Promise<void> {
+    try {
+      await ctx.dest.post(`${ctx.destUserPath}/events/${destEventId}/extensions`, {
+        '@odata.type': 'microsoft.graph.openTypeExtension',
+        extensionName: 'com.dolop.migration',
+        originalAttendees: JSON.stringify(attendees).slice(0, 30_000),
+        originalOrganizer: JSON.stringify(ev.organizer ?? null),
+      });
+    } catch (e) {
+      if (!(e instanceof GraphError) || e.name === 'GraphThrottleError') throw e;
+      ctx.report.itemError(W, {
+        itemType: 'event-extension',
+        itemId: ev.id,
+        itemName: ev.subject,
+        code: e.code,
+        message: `event migrated but its original attendee list could not be stored: ${e.message}`,
+      });
+    }
+    ctx.store.delCarry(W, 'extension');
   }
 }

@@ -11,7 +11,7 @@
 // attachments (upload sessions for large ones). The id map makes every pass
 // idempotent.
 
-import { GraphError } from '../graph/client';
+import { GraphError, GraphThrottleError } from '../graph/client';
 import type { GraphAttachment, GraphMessage, MailFolder } from '../graph/types';
 import {
   isPathExcluded,
@@ -61,6 +61,8 @@ interface PageAdvance {
 interface AttachmentResume {
   srcMsgId: string;
   destMsgId: string;
+  /** The message exists in the destination but its attachments aren't listed yet. */
+  unlisted?: boolean;
   remaining: { id: string; name?: string; size: number }[];
   /** in-flight large attachment upload */
   upload?: { attId: string; sessionUrl: string; offset: number; size: number; name?: string };
@@ -382,6 +384,7 @@ export class MailEngine implements WorkloadEngine {
     // existing copy is missing its attachments (e.g. a pre-fix failure), queue
     // them for repair.
     if (ctx.pass.filters.mailDedupeByMessageId && msg.internetMessageId) {
+      let hit: { id: string; hasAttachments?: boolean } | undefined;
       try {
         const safe = msg.internetMessageId.replace(/'/g, "''");
         const found = await dest.get<{ value: { id: string; hasAttachments?: boolean }[] }>(
@@ -389,10 +392,16 @@ export class MailEngine implements WorkloadEngine {
             `internetMessageId eq '${safe}'`
           )}&$select=id,hasAttachments&$top=1`
         );
-        const hit = found.value?.[0];
-        if (hit) {
-          store.mapPut(W, 'item', msgId, hit.id);
-          if (msg.hasAttachments && !hit.hasAttachments) {
+        hit = found.value?.[0];
+      } catch (e) {
+        // Dedupe is best-effort, so a failed lookup falls through and creates
+        // the message — but a throttle must pause the tick instead: creating
+        // here is exactly the duplicate this check exists to prevent.
+        if (e instanceof GraphThrottleError) throw e;
+      }
+      if (hit) {
+        if (msg.hasAttachments && !hit.hasAttachments) {
+          try {
             const list = await source.get<{ value: GraphAttachment[] }>(
               `${ctx.sourceUserPath}/messages/${msgId}/attachments?$select=id,name,contentType,size,isInline`
             );
@@ -406,13 +415,21 @@ export class MailEngine implements WorkloadEngine {
                 tries: 0,
               } satisfies AttRetryWork);
             }
+          } catch (e) {
+            if (!(e instanceof GraphError) || e instanceof GraphThrottleError) throw e;
+            report.itemError(W, {
+              itemType: 'attachment',
+              itemId: msgId,
+              itemName: msg.subject,
+              code: e.code,
+              message: `existing copy is missing attachments, which could not be listed: ${e.message}`,
+            });
           }
-          report.stat(W, 'skipped');
-          skip();
-          return;
         }
-      } catch {
-        // dedupe is best-effort — fall through and create the message
+        store.mapPut(W, 'item', msgId, hit.id);
+        report.stat(W, 'skipped');
+        skip();
+        return;
       }
     }
 
@@ -424,14 +441,9 @@ export class MailEngine implements WorkloadEngine {
       );
       ctx.report.bytes(W, msg.body?.content?.length ?? 0);
       if (msg.hasAttachments) {
-        const list = await source.get<{ value: GraphAttachment[] }>(
-          `${ctx.sourceUserPath}/messages/${msgId}/attachments?$select=id,name,contentType,size,isInline`
-        );
-        const att: AttachmentResume = {
-          srcMsgId: msgId,
-          destMsgId: created.id,
-          remaining: (list.value ?? []).map((a) => ({ id: a.id, name: a.name, size: a.size ?? 0 })),
-        };
+        // Record the copy before anything else can throw: a throttle while
+        // listing attachments must resume this message, not create it again.
+        const att: AttachmentResume = { srcMsgId: msgId, destMsgId: created.id, unlisted: true, remaining: [] };
         store.setCarry(W, 'att', att);
         await this.copyAttachments(ctx, att);
       }
@@ -493,6 +505,27 @@ export class MailEngine implements WorkloadEngine {
 
   private async copyAttachments(ctx: MigrationContext, att: AttachmentResume): Promise<void> {
     const { store, source, dest, report } = ctx;
+
+    if (att.unlisted) {
+      try {
+        const list = await source.get<{ value: GraphAttachment[] }>(
+          `${ctx.sourceUserPath}/messages/${att.srcMsgId}/attachments?$select=id,name,contentType,size,isInline`
+        );
+        att.remaining = (list.value ?? []).map((a) => ({ id: a.id, name: a.name, size: a.size ?? 0 }));
+      } catch (e) {
+        if (!(e instanceof GraphError) || e instanceof GraphThrottleError) throw e;
+        // The message itself is copied; record the gap rather than fail it
+        // (a failed message would be copied again — a duplicate).
+        report.itemError(W, {
+          itemType: 'attachment',
+          itemId: att.srcMsgId,
+          code: e.code,
+          message: `message copied but its attachments could not be listed: ${e.message}`,
+        });
+      }
+      att.unlisted = false;
+      store.setCarry(W, 'att', att);
+    }
 
     while (att.upload || att.remaining.length > 0) {
       if (att.upload) {

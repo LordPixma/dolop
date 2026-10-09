@@ -24,7 +24,13 @@ interface FileWork {
   downloadUrl?: string;
   cTag?: string;
   fsInfo?: { createdDateTime?: string; lastModifiedDateTime?: string };
+  /** Failed attempts so far (set on fileretry work). */
+  tries?: number;
+  /** Pass in which the last attempt failed; retried only from the next one. */
+  pass?: number;
 }
+
+const MAX_FILE_TRIES = 3;
 
 interface UploadState extends FileWork {
   sessionUrl: string;
@@ -119,13 +125,20 @@ export class DriveEngine implements WorkloadEngine {
         await this.continueUpload(ctx, srcDriveId, upload);
         continue;
       }
-      // 2. Copy the next queued file.
+      // 2. Retry files that failed in an earlier pass. Retries queued by this
+      //    pass sit behind them (higher ids), so they wait for the next pass.
+      const retry = store.peekWork<FileWork>(W, 'fileretry');
+      if (retry && (retry.payload.pass ?? 0) < store.passSeq) {
+        await this.copyFile(ctx, srcDriveId, dstDriveId, retry.id, retry.payload);
+        continue;
+      }
+      // 3. Copy the next queued file.
       const work = store.peekWork<FileWork>(W, 'file');
       if (work) {
         await this.copyFile(ctx, srcDriveId, dstDriveId, work.id, work.payload);
         continue;
       }
-      // 3. The page's files are all copied: only now move the persisted delta
+      // 4. The page's files are all copied: only now move the persisted delta
       //    cursor past it. Advancing on fetch would let a pass that stops
       //    mid-page lose its queued files and in-flight upload for good —
       //    resetPass() drops both but keeps cursors. Re-reading a page after
@@ -137,7 +150,7 @@ export class DriveEngine implements WorkloadEngine {
         if (advance.last) store.setState(W, 'enumDone', true);
         continue;
       }
-      // 4. Advance delta enumeration.
+      // 5. Advance delta enumeration.
       if (store.getState<boolean>(W, 'enumDone')) return 'done';
       await this.fetchDeltaPage(ctx, srcDriveId);
     }
@@ -192,6 +205,38 @@ export class DriveEngine implements WorkloadEngine {
       cursor: page.deltaLink ?? page.nextLink,
       last: Boolean(page.deltaLink) || !page.nextLink,
     } satisfies DeltaAdvance);
+  }
+
+  /**
+   * Record a failed file. It is queued for a later pass (up to
+   * MAX_FILE_TRIES attempts): once the delta cursor moves past it, the feed
+   * would only offer it again if the file changed.
+   */
+  private queueFileRetry(ctx: MigrationContext, file: FileWork, e: GraphError): void {
+    const attempt = (file.tries ?? 0) + 1;
+    const final = attempt >= MAX_FILE_TRIES;
+    ctx.report.itemError(W, {
+      itemType: 'file',
+      itemId: file.srcId,
+      itemName: `${file.parentPath}/${file.name}`,
+      code: e.code,
+      message: final
+        ? `${e.message} (giving up after ${attempt} attempts)`
+        : `${e.message} (will retry on the next pass, attempt ${attempt}/${MAX_FILE_TRIES})`,
+    });
+    ctx.report.stat(W, 'failed');
+    if (final) return;
+    ctx.store.pushWork(W, 'fileretry', {
+      srcId: file.srcId,
+      parentPath: file.parentPath,
+      name: file.name,
+      size: file.size,
+      cTag: file.cTag,
+      fsInfo: file.fsInfo,
+      // download URLs are short-lived; the retry fetches a fresh one
+      tries: attempt,
+      pass: ctx.store.passSeq,
+    } satisfies FileWork);
   }
 
   /** Find-or-create the destination folder for a relative path; '' = root. */
@@ -301,14 +346,7 @@ export class DriveEngine implements WorkloadEngine {
         if (e.status === 404) {
           report.stat(W, 'skipped'); // deleted at source since enumeration
         } else {
-          report.itemError(W, {
-            itemType: 'file',
-            itemId: file.srcId,
-            itemName: `${file.parentPath}/${file.name}`,
-            code: e.code,
-            message: e.message,
-          });
-          report.stat(W, 'failed');
+          this.queueFileRetry(ctx, file, e);
         }
         store.popWork(workId);
         ctx.budget.itemDone();
@@ -354,14 +392,7 @@ export class DriveEngine implements WorkloadEngine {
       }
     } catch (e) {
       if (e instanceof GraphError && e.name !== 'GraphThrottleError') {
-        report.itemError(W, {
-          itemType: 'file',
-          itemId: up.srcId,
-          itemName: `${up.parentPath}/${up.name}`,
-          code: e.code,
-          message: e.message,
-        });
-        report.stat(W, 'failed');
+        this.queueFileRetry(ctx, up, e);
         store.delState(W, 'upload');
         ctx.budget.itemDone();
         return;

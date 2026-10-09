@@ -70,6 +70,8 @@ interface AttachmentResume {
   retry?: boolean;
   workId?: number;
   tries?: number;
+  /** set when the message itself is being retried from the msgretry queue */
+  msgRetryWorkId?: number;
 }
 
 /** A failed attachment copy queued for replay on a later tick or pass. */
@@ -83,6 +85,33 @@ interface AttRetryWork {
 }
 
 const MAX_ATTACHMENT_TRIES = 3;
+
+/** Where a message is copied to. */
+interface MessageTarget {
+  destFolderId: string;
+  asDraft: boolean;
+}
+
+/** A message that failed to copy, retried in a later pass (queue survives pass resets). */
+interface MsgRetryWork extends MessageTarget {
+  srcMsgId: string;
+  /** Attempts so far. */
+  tries: number;
+  /** Pass in which the last attempt failed; retried only from the next one. */
+  pass: number;
+}
+
+const MAX_MESSAGE_TRIES = 3;
+
+/** How a message being copied is accounted for once it's handled. */
+interface MessageJob {
+  /** Earlier failed attempts (0 for a message from the delta feed). */
+  tries: number;
+  /** Set when replaying a msgretry work item. */
+  retryWorkId?: number;
+  /** Called when the message is handled without being copied (skipped or failed). */
+  done: () => void;
+}
 
 export class MailEngine implements WorkloadEngine {
   readonly name = 'mail';
@@ -260,7 +289,7 @@ export class MailEngine implements WorkloadEngine {
           if (att.workId !== undefined) store.popWork(att.workId);
           ctx.budget.itemDone();
         } else {
-          this.finishMessage(ctx, att.srcMsgId, att.destMsgId);
+          this.finishMessage(ctx, att.srcMsgId, att.destMsgId, att.msgRetryWorkId);
         }
         continue;
       }
@@ -280,6 +309,22 @@ export class MailEngine implements WorkloadEngine {
         continue;
       }
 
+      // Retry messages that failed in an earlier pass. Retries queued by this
+      // pass sit behind them (higher ids), so they wait for the next pass.
+      const msgRetry = store.peekWork<MsgRetryWork>(W, 'msgretry');
+      if (msgRetry && msgRetry.payload.pass < store.passSeq) {
+        const r = msgRetry.payload;
+        await this.migrateOne(ctx, r, r.srcMsgId, {
+          tries: r.tries,
+          retryWorkId: msgRetry.id,
+          done: () => {
+            store.popWork(msgRetry.id);
+            ctx.budget.itemDone();
+          },
+        });
+        continue;
+      }
+
       const work = store.peekWork<ScanWork>(W, 'scan');
       if (!work) return 'done';
       const scan = work.payload;
@@ -287,7 +332,14 @@ export class MailEngine implements WorkloadEngine {
 
       const pending = store.getState<string[]>(W, 'pending') ?? [];
       if (pending.length > 0) {
-        await this.migrateOne(ctx, scan, pending);
+        await this.migrateOne(ctx, scan, pending[0]!, {
+          tries: 0,
+          done: () => {
+            pending.shift();
+            store.setState(W, 'pending', pending);
+            ctx.budget.itemDone();
+          },
+        });
         continue;
       }
 
@@ -324,27 +376,61 @@ export class MailEngine implements WorkloadEngine {
     return 'continue';
   }
 
-  private finishMessage(ctx: MigrationContext, srcMsgId: string, destMsgId: string): void {
+  private finishMessage(ctx: MigrationContext, srcMsgId: string, destMsgId: string, msgRetryWorkId?: number): void {
     ctx.store.mapPut(W, 'item', srcMsgId, destMsgId);
     ctx.store.delCarry(W, 'att');
-    const pending = ctx.store.getState<string[]>(W, 'pending') ?? [];
-    if (pending[0] === srcMsgId) {
-      pending.shift();
-      ctx.store.setState(W, 'pending', pending);
+    if (msgRetryWorkId !== undefined) {
+      ctx.store.popWork(msgRetryWorkId);
+    } else {
+      const pending = ctx.store.getState<string[]>(W, 'pending') ?? [];
+      if (pending[0] === srcMsgId) {
+        pending.shift();
+        ctx.store.setState(W, 'pending', pending);
+      }
     }
     ctx.report.stat(W, 'migrated');
     ctx.budget.itemDone();
   }
 
-  private async migrateOne(ctx: MigrationContext, scan: ScanWork, pending: string[]): Promise<void> {
+  /**
+   * Record a failed message. It is queued for a later pass (up to
+   * MAX_MESSAGE_TRIES attempts): once the delta cursor moves past it, the
+   * feed would never offer it again.
+   */
+  private queueMessageRetry(
+    ctx: MigrationContext,
+    target: MessageTarget,
+    msgId: string,
+    subject: string | undefined,
+    e: GraphError,
+    tries: number
+  ): void {
+    const attempt = tries + 1;
+    const final = attempt >= MAX_MESSAGE_TRIES;
+    ctx.report.itemError(W, {
+      itemType: 'message',
+      itemId: msgId,
+      itemName: subject,
+      code: e.code,
+      message: final
+        ? `${e.message} (giving up after ${attempt} attempts)`
+        : `${e.message} (will retry on the next pass, attempt ${attempt}/${MAX_MESSAGE_TRIES})`,
+    });
+    ctx.report.stat(W, 'failed');
+    if (!final) {
+      ctx.store.pushWork(W, 'msgretry', {
+        srcMsgId: msgId,
+        destFolderId: target.destFolderId,
+        asDraft: target.asDraft,
+        tries: attempt,
+        pass: ctx.store.passSeq,
+      } satisfies MsgRetryWork);
+    }
+  }
+
+  private async migrateOne(ctx: MigrationContext, target: MessageTarget, msgId: string, job: MessageJob): Promise<void> {
     const { store, source, dest, report } = ctx;
-    const msgId = pending[0];
-    if (!msgId) return;
-    const skip = () => {
-      pending.shift();
-      store.setState(W, 'pending', pending);
-      ctx.budget.itemDone();
-    };
+    const skip = job.done;
 
     if (store.mapGet(W, 'item', msgId)) {
       report.stat(W, 'skipped');
@@ -361,8 +447,7 @@ export class MailEngine implements WorkloadEngine {
           // deleted at source since enumeration
           report.stat(W, 'skipped');
         } else {
-          report.itemError(W, { itemType: 'message', itemId: msgId, code: e.code, message: e.message });
-          report.stat(W, 'failed');
+          this.queueMessageRetry(ctx, target, msgId, undefined, e, job.tries);
         }
         skip();
         return;
@@ -382,8 +467,9 @@ export class MailEngine implements WorkloadEngine {
     // Optional convergence net: if the destination already holds this message
     // (matched by Internet Message-ID), map it instead of duplicating. When the
     // existing copy is missing its attachments (e.g. a pre-fix failure), queue
-    // them for repair.
-    if (ctx.pass.filters.mailDedupeByMessageId && msg.internetMessageId) {
+    // them for repair. Always done for a retried message: the attempt that
+    // failed may have created it before the error came back.
+    if ((ctx.pass.filters.mailDedupeByMessageId || job.tries > 0) && msg.internetMessageId) {
       let hit: { id: string; hasAttachments?: boolean } | undefined;
       try {
         const safe = msg.internetMessageId.replace(/'/g, "''");
@@ -433,31 +519,30 @@ export class MailEngine implements WorkloadEngine {
       }
     }
 
-    const asDraft = scan.asDraft || msg.isDraft === true;
+    const asDraft = target.asDraft || msg.isDraft === true;
     try {
       const created = await dest.post<{ id: string }>(
-        `${ctx.destUserPath}/mailFolders/${scan.destFolderId}/messages`,
+        `${ctx.destUserPath}/mailFolders/${target.destFolderId}/messages`,
         buildMessagePayload(msg, { asDraft })
       );
       ctx.report.bytes(W, msg.body?.content?.length ?? 0);
       if (msg.hasAttachments) {
         // Record the copy before anything else can throw: a throttle while
         // listing attachments must resume this message, not create it again.
-        const att: AttachmentResume = { srcMsgId: msgId, destMsgId: created.id, unlisted: true, remaining: [] };
+        const att: AttachmentResume = {
+          srcMsgId: msgId,
+          destMsgId: created.id,
+          unlisted: true,
+          remaining: [],
+          msgRetryWorkId: job.retryWorkId,
+        };
         store.setCarry(W, 'att', att);
         await this.copyAttachments(ctx, att);
       }
-      this.finishMessage(ctx, msgId, created.id);
+      this.finishMessage(ctx, msgId, created.id, job.retryWorkId);
     } catch (e) {
       if (e instanceof GraphError && e.name !== 'GraphThrottleError') {
-        report.itemError(W, {
-          itemType: 'message',
-          itemId: msgId,
-          itemName: msg.subject,
-          code: e.code,
-          message: e.message,
-        });
-        report.stat(W, 'failed');
+        this.queueMessageRetry(ctx, target, msgId, msg.subject, e, job.tries);
         store.delCarry(W, 'att');
         skip();
         return;

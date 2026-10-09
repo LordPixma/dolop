@@ -51,7 +51,7 @@ export const json = (data: unknown, status = 200): Response => Response.json(dat
  */
 export class FakeGraph {
   private routes: { method: string; pattern: RegExp; handler: Handler }[] = [];
-  private failures: { method: string; pattern: RegExp; times: number; after: number }[] = [];
+  private failures: { method: string; pattern: RegExp; times: number; after: number; status: number }[] = [];
   readonly log: string[] = [];
 
   route(method: string, pattern: RegExp, handler: Handler): this {
@@ -61,7 +61,12 @@ export class FakeGraph {
 
   /** After letting `after` matching requests through, answer the next `times` with 429. */
   throttle(method: string, pattern: RegExp, opts: { times?: number; after?: number } = {}): void {
-    this.failures.push({ method, pattern, times: opts.times ?? 1, after: opts.after ?? 0 });
+    this.fail(method, pattern, { ...opts, status: 429 });
+  }
+
+  /** After letting `after` matching requests through, answer the next `times` with an error status. */
+  fail(method: string, pattern: RegExp, opts: { times?: number; after?: number; status?: number } = {}): void {
+    this.failures.push({ method, pattern, times: opts.times ?? 1, after: opts.after ?? 0, status: opts.status ?? 500 });
   }
 
   readonly fetch = async (input: string | URL | Request, init: RequestInit = {}): Promise<Response> => {
@@ -76,7 +81,8 @@ export class FakeGraph {
       failure.after--;
     } else if (failure) {
       failure.times--;
-      return new Response(null, { status: 429, headers: { 'retry-after': '1' } });
+      if (failure.status === 429) return new Response(null, { status: 429, headers: { 'retry-after': '1' } });
+      return json({ error: { code: `Injected${failure.status}`, message: 'injected failure' } }, failure.status);
     }
     for (const r of this.routes) {
       const m = r.method === method ? target.match(r.pattern) : null;

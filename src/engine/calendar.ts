@@ -153,8 +153,7 @@ export class CalendarEngine implements WorkloadEngine {
         code: e.code,
         message: e.message,
       });
-      report.stat(W, 'failed');
-      store.mapPut(W, 'item', ev.id, 'failed'); // don't retry forever within this pass
+      report.stat(W, 'failed'); // left unmapped, so the next pass retries it
     }
     ctx.budget.itemDone();
   }

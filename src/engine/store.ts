@@ -6,6 +6,9 @@
 //   cursor:<workload>:<key>     persistent cursors — delta links — survive passes
 //   carry:<workload>:<key>      in-flight work a stopped pass hands to the next
 //                               pass (e.g. a message whose attachments are mid-copy)
+//   pass:seq                    number of passes started (retry bookkeeping)
+// Work items whose kind ends in "retry" (failed items queued for a later
+// pass) also survive pass resets.
 //   sys:<key>                   orchestrator bookkeeping (current pass, indexes…)
 // The idmap table (source item id → destination item id) survives passes and is
 // what makes pre-stage → full → delta sequences idempotent.
@@ -110,7 +113,10 @@ export class EngineStore {
     const rows = this.sql
       .exec<{ dst: string }>('SELECT dst FROM idmap WHERE workload = ? AND kind = ? AND src = ?', workload, kind, src)
       .toArray();
-    return rows[0]?.dst ?? null;
+    const dst = rows[0]?.dst ?? null;
+    // Older versions stored 'failed' for items that couldn't be copied, which
+    // made every later pass skip them; treat those as not yet copied.
+    return dst === 'failed' ? null : dst;
   }
 
   mapPut(workload: string, kind: string, src: string, dst: string): void {
@@ -189,8 +195,15 @@ export class EngineStore {
    */
   resetPass(): void {
     this.sql.exec(`DELETE FROM kv WHERE k LIKE 'phase:%' OR k LIKE 'state:%'`);
-    // Queued attachment repairs survive into the next pass so they self-heal.
-    this.sql.exec(`DELETE FROM work WHERE kind <> 'attretry'`);
+    // Queued retries (attachment repairs, failed messages and files) survive
+    // into the next pass so they self-heal.
+    this.sql.exec(`DELETE FROM work WHERE kind NOT LIKE '%retry'`);
+    this.setRaw('pass:seq', String(this.passSeq + 1));
+  }
+
+  /** Passes started for this user; an item that failed in pass N is retried from pass N+1. */
+  get passSeq(): number {
+    return parseInt(this.getRaw('pass:seq') ?? '0', 10);
   }
 
   /**

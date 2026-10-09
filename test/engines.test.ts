@@ -198,6 +198,80 @@ describe('throttling never duplicates or drops work', () => {
   });
 });
 
+describe('failed items are retried on later passes', () => {
+  it('contacts: a contact that failed is copied by the next pass', async () => {
+    const { all, created } = contactsTenant(fake, { defaultCount: 5 });
+    fake.fail('POST', /^\/users\/dst\/contacts$/, { after: 2, status: 400 });
+    const h = new EngineHarness(FULL);
+    await h.run(new ContactsEngine());
+    expect(created).toHaveLength(4);
+    expect(h.stats.contacts).toMatchObject({ migrated: 4, failed: 1 });
+    h.newPass();
+    await h.run(new ContactsEngine());
+    expectEachOnce(created.map((c) => c.name), all);
+  });
+
+  it('contacts: items an older version marked "failed" in the id map are retried', async () => {
+    const { all, created } = contactsTenant(fake, { defaultCount: 3 });
+    const h = new EngineHarness(FULL);
+    h.store.mapPut('contacts', 'item', 'c1', 'failed');
+    await h.run(new ContactsEngine());
+    expectEachOnce(created.map((c) => c.name), all);
+  });
+
+  it('tasks: a task that failed is copied by the next pass', async () => {
+    const tasks = range(3).map((i) => ({ id: `t${i}`, title: `Task ${i}` }));
+    const { created } = tasksTenant(fake, [{ id: 'l1', name: 'Tasks', isDefault: true, tasks }]);
+    fake.fail('POST', /^\/users\/dst\/todo\/lists\/[^/]+\/tasks$/, { after: 1, status: 400 });
+    const h = new EngineHarness(FULL);
+    await h.run(new TasksEngine());
+    h.newPass();
+    await h.run(new TasksEngine());
+    expectEachOnce(created.map((t) => t.title), tasks.map((t) => t.title));
+  });
+
+  it('mail: a message that failed is copied by the next pass, without a duplicate', async () => {
+    const { allMessages, created } = mailbox(fake, 5);
+    fake.fail('POST', /^\/users\/dst\/mailFolders\/[^/]+\/messages$/, { after: 2 });
+    const h = new EngineHarness(FULL);
+    await h.run(new MailEngine());
+    expect(created).toHaveLength(4);
+    expect(h.stats.mail).toMatchObject({ migrated: 4, failed: 1 });
+    h.newPass();
+    await h.run(new MailEngine());
+    expectEachOnce(created.map((c) => c.subject), allMessages.map((m) => m.subject));
+    expect(h.stats.mail).toMatchObject({ migrated: 1, failed: 0 });
+  });
+
+  it('mail: gives up on a message after three failed passes', async () => {
+    const { created } = mailbox(fake, 2);
+    fake.fail('GET', /^\/users\/src\/messages\/f-inbox-m1$/, { times: 6, status: 400 });
+    const h = new EngineHarness(FULL);
+    for (let pass = 1; pass <= 4; pass++) {
+      if (pass > 1) h.newPass();
+      await h.run(new MailEngine());
+      expect(h.stats.mail?.failed ?? 0, `pass ${pass}`).toBe(pass <= 3 ? 1 : 0);
+    }
+    expect(created.map((c) => c.subject)).toEqual(['Inbox 0']);
+  });
+
+  it('mail: a retried message is matched by Message-ID if the failed POST actually created it', async () => {
+    const { allMessages, created } = mailbox(fake, 3);
+    // the POST for the 2nd message "fails" after the destination already stored it
+    let posts = 0;
+    fake.route('POST', /^\/users\/dst\/mailFolders\/[^/]+\/messages$/, (req) => {
+      const id = `dm${created.length}`;
+      created.push({ id, folder: 'f', subject: req.body.subject, internetMessageId: req.body.internetMessageId, attachments: [] });
+      return ++posts === 2 ? json({ error: { code: 'ServiceUnavailable', message: 'late' } }, 500) : json({ id }, 201);
+    });
+    const h = new EngineHarness(FULL);
+    await h.run(new MailEngine());
+    h.newPass();
+    await h.run(new MailEngine());
+    expectEachOnce(created.map((c) => c.subject), allMessages.map((m) => m.subject));
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Delta engines: a pass that stops mid-page must not lose that page
 
@@ -279,6 +353,7 @@ describe('drive engine', () => {
       .route('GET', /^\/users\/dst\/drive$/, () => json({ id: 'dst-drive' }))
       .route('GET', /^\/drives\/src-drive\/root\/delta$/, (req) => pageOf(items, req, { delta: true }))
       .route('GET', /^\/drives\/dst-drive\/root$/, () => json({ id: 'droot' }))
+      .route('GET', /^\/drives\/src-drive\/items\/([^/]+)$/, (req) => json(items.find((x) => x.id === req.m[1])))
       .route('GET', /^download\.test\/(f\d+)$/, (req) => {
         const [, start, end] = /bytes=(\d+)-(\d+)/.exec(req.headers.get('range') ?? '') ?? [];
         return new Response(new Uint8Array(Number(end) - Number(start) + 1), { status: 206 });
@@ -312,6 +387,20 @@ describe('drive engine', () => {
     h.newPass();
     await h.run(new DriveEngine());
     expectEachOnce(uploaded, files.map((f) => f.name));
+  });
+
+  it('copies a file that failed on the next pass', async () => {
+    const files = range(4).map((i) => ({ name: `file${i}.txt`, size: 10 }));
+    const { uploaded } = oneDrive(files);
+    fake.fail('PUT', /file2\.txt:\/content$/, { times: 2 }); // the client's one retry fails too
+    const h = new EngineHarness(FULL);
+    await h.run(new DriveEngine());
+    expect(uploaded.sort()).toEqual(['file0.txt', 'file1.txt', 'file3.txt']);
+    expect(h.stats.drive).toMatchObject({ migrated: 3, failed: 1 });
+    h.newPass();
+    await h.run(new DriveEngine());
+    expectEachOnce(uploaded, files.map((f) => f.name));
+    expect(h.stats.drive).toMatchObject({ migrated: 1, failed: 0 });
   });
 
   it('re-copies a large file whose upload was interrupted by a stopped pass', async () => {

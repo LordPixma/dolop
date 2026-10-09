@@ -160,8 +160,7 @@ export class TasksEngine implements WorkloadEngine {
         code: e.code,
         message: e.message,
       });
-      report.stat(W, 'failed');
-      store.mapPut(W, 'item', task.id, 'failed');
+      report.stat(W, 'failed'); // left unmapped, so the next pass retries it
     }
     ctx.budget.itemDone();
   }

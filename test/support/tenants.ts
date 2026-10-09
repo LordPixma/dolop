@@ -128,7 +128,20 @@ export interface SrcMailFolder {
   messages?: number;
   /** message index → number of small attachments */
   attachments?: Record<number, number>;
+  /**
+   * message index → one large attachment. `size` is the metadata size Graph
+   * reports, `content` the real byte length (they can differ); with
+   * `ignoresRange` the source answers ranged reads with the whole body.
+   */
+  bigAttachment?: Record<number, { size: number; content: number; ignoresRange?: boolean }>;
 }
+
+/** Deterministic attachment content, so uploads can be verified byte for byte. */
+export const attachmentBytes = (length: number): Uint8Array => {
+  const out = new Uint8Array(length);
+  for (let i = 0; i < length; i++) out[i] = (i * 7 + 3) % 251;
+  return out;
+};
 
 export interface SrcMessage {
   id: string;
@@ -142,18 +155,20 @@ export interface SrcMessage {
 export function mailTenant(fake: FakeGraph, folders: SrcMailFolder[]) {
   const messages = new Map<string, SrcMessage[]>();
   const attachmentCount = new Map<string, number>();
+  const bigAttachments = new Map<string, { size: number; content: number; ignoresRange?: boolean }>();
   for (const f of folders) {
     messages.set(
       f.id,
       range(f.messages ?? 0).map((i) => {
         const id = `${f.id}-m${i}`;
         attachmentCount.set(id, f.attachments?.[i] ?? 0);
+        if (f.bigAttachment?.[i]) bigAttachments.set(`${id}-big`, f.bigAttachment[i]!);
         return {
           id,
           subject: `${f.name} ${i}`,
           receivedDateTime: new Date(Date.UTC(2026, 0, 1 + i)).toISOString().replace('.000', ''),
           body: { contentType: 'text', content: 'hello' },
-          hasAttachments: (f.attachments?.[i] ?? 0) > 0,
+          hasAttachments: (f.attachments?.[i] ?? 0) > 0 || Boolean(f.bigAttachment?.[i]),
           internetMessageId: `<${id}@src.test>`,
         };
       })
@@ -202,11 +217,28 @@ export function mailTenant(fake: FakeGraph, folders: SrcMailFolder[]) {
         { delta: true }
       );
     })
-    .route('GET', /^\/users\/src\/messages\/([^/]+)\/attachments$/, (req) =>
-      json({
-        value: range(attachmentCount.get(req.m[1]!) ?? 0).map((j) => ({ id: `${req.m[1]}-a${j}`, name: `file${j}.txt`, size: 5 })),
-      })
-    )
+    .route('GET', /^\/users\/src\/messages\/([^/]+)\/attachments$/, (req) => {
+      const big = bigAttachments.get(`${req.m[1]}-big`);
+      return json({
+        value: [
+          ...range(attachmentCount.get(req.m[1]!) ?? 0).map((j) => ({ id: `${req.m[1]}-a${j}`, name: `file${j}.txt`, size: 5 })),
+          ...(big ? [{ id: `${req.m[1]}-big`, name: 'big.bin', size: big.size }] : []),
+        ],
+      });
+    })
+    .route('GET', /^\/users\/src\/messages\/[^/]+\/attachments\/([^/]+)\/\$value$/, (req) => {
+      const big = bigAttachments.get(req.m[1]!)!;
+      const content = attachmentBytes(big.content);
+      const m = /bytes=(\d+)-(\d+)/.exec(req.headers.get('range') ?? '');
+      if (!m || big.ignoresRange) return new Response(content, { status: 200, headers: { 'content-length': String(big.content) } });
+      const start = Number(m[1]);
+      if (start >= big.content) return json({ error: { code: 'RangeNotSatisfiable' } }, 416);
+      const end = Math.min(Number(m[2]), big.content - 1);
+      return new Response(content.slice(start, end + 1), {
+        status: 206,
+        headers: { 'content-range': `bytes ${start}-${end}/${big.content}` },
+      });
+    })
     .route('GET', /^\/users\/src\/messages\/([^/]+)\/attachments\/([^/]+)$/, (req) =>
       json({ '@odata.type': '#microsoft.graph.fileAttachment', id: req.m[2], name: `${req.m[2]}.txt`, contentBytes: 'aGVsbG8=' })
     )
@@ -238,8 +270,42 @@ export function mailTenant(fake: FakeGraph, folders: SrcMailFolder[]) {
     .route('POST', /^\/users\/dst\/messages\/([^/]+)\/attachments$/, (req) => {
       created.find((c) => c.id === req.m[1])!.attachments.push(req.body.name);
       return json({ id: 'att' }, 201);
+    })
+    // Outlook attachment upload sessions: every intermediate chunk is
+    // acknowledged with 200 + nextExpectedRanges, the final one with 201.
+    .route('POST', /^\/users\/dst\/messages\/([^/]+)\/attachments\/createUploadSession$/, (req) => {
+      const id = `u${uploads.length}`;
+      uploads.push({ id, message: req.m[1]!, name: req.body.AttachmentItem.name, declared: req.body.AttachmentItem.size, data: [] });
+      return json({ uploadUrl: `https://outlook-upload.test/${id}` }, 201);
+    })
+    .route('PUT', /^outlook-upload\.test\/(u\d+)$/, (req) => {
+      const u = uploads.find((x) => x.id === req.m[1])!;
+      const [, start, end, total] = /bytes (\d+)-(\d+)\/(\d+)/.exec(req.headers.get('content-range') ?? '')!.map(Number);
+      const received = u.data.reduce((n, c) => n + c.byteLength, 0);
+      const body = new Uint8Array(req.raw!);
+      if (start !== received || end! - start! + 1 !== body.byteLength || total !== u.declared) {
+        return json({ error: { code: 'InvalidContentRange', message: `bad range ${start}-${end}/${total}` } }, 400);
+      }
+      u.data.push(body);
+      if (received + body.byteLength < u.declared) {
+        return json({ expirationDateTime: '2030-01-01T00:00:00Z', nextExpectedRanges: [`${received + body.byteLength}-`] }, 200);
+      }
+      created.find((c) => c.id === u.message)!.attachments.push(u.name);
+      return new Response(null, { status: 201, headers: { location: `https://graph.test/attachments/${u.id}` } });
     });
-  return { messages, allMessages, created, destFolders, deltaUrls };
+  /** Destination attachment upload sessions and the bytes each received. */
+  const uploads: { id: string; message: string; name: string; declared: number; data: Uint8Array[] }[] = [];
+  /** The bytes an upload session assembled. */
+  const uploaded = (u: (typeof uploads)[number]) => {
+    const out = new Uint8Array(u.data.reduce((n, c) => n + c.byteLength, 0));
+    let at = 0;
+    for (const c of u.data) {
+      out.set(c, at);
+      at += c.byteLength;
+    }
+    return out;
+  };
+  return { messages, allMessages, created, destFolders, deltaUrls, uploads, uploaded };
 }
 
 /** A single inbox with `n` messages (and optional attachments per message index). */

@@ -21,7 +21,7 @@ import {
   nextChunkRange,
 } from '../util';
 import { buildMessagePayload } from './transform';
-import { putUploadChunk } from './upload';
+import { putUploadChunk, readByteRange } from './upload';
 import type { MigrationContext, StepResult, WorkloadEngine } from './workload';
 
 const W = 'mail';
@@ -625,6 +625,20 @@ export class MailEngine implements WorkloadEngine {
     } satisfies AttRetryWork);
   }
 
+  /** Real byte length of an attachment's content (from a 1-byte ranged read), or null if unknown. */
+  private async attachmentLength(ctx: MigrationContext, srcMsgId: string, attId: string): Promise<number | null> {
+    const res = await ctx.source.requestRaw(
+      'GET',
+      `${ctx.sourceUserPath}/messages/${srcMsgId}/attachments/${attId}/$value`,
+      { headers: { range: 'bytes=0-0' } }
+    );
+    const total = /\/(\d+)\s*$/.exec(res.headers.get('content-range') ?? '')?.[1];
+    const length = total ?? (res.status === 200 ? res.headers.get('content-length') : null);
+    await res.body?.cancel();
+    const n = length ? parseInt(length, 10) : NaN;
+    return Number.isFinite(n) && n > 0 ? n : null;
+  }
+
   private async copyAttachments(ctx: MigrationContext, att: AttachmentResume): Promise<void> {
     const { store, source, dest, report } = ctx;
 
@@ -665,14 +679,17 @@ export class MailEngine implements WorkloadEngine {
             `${ctx.sourceUserPath}/messages/${att.srcMsgId}/attachments/${up.attId}/$value`,
             { headers: { range: `bytes=${range.start}-${range.end}` } }
           );
-          let bytes = await res.arrayBuffer();
-          if (res.status === 200 && bytes.byteLength > range.length) {
-            // source ignored the Range header and returned the full content
-            bytes = bytes.slice(range.start, range.end + 1);
+          const bytes = await readByteRange(res, range.start, range.length);
+          if (bytes.byteLength !== range.length) {
+            throw new GraphError(
+              502,
+              'attachment_short_read',
+              `expected ${range.length} bytes of attachment content at offset ${range.start}, got ${bytes.byteLength}`
+            );
           }
           const result = await putUploadChunk(up.sessionUrl, bytes, range.start, range.end, up.size);
-          up.offset = range.end + 1;
-          report.bytes(W, range.length);
+          up.offset = result.nextOffset ?? range.end + 1;
+          if (result.nextOffset === undefined) report.bytes(W, range.length);
           if (result.done || up.offset >= up.size) att.upload = undefined;
           store.setCarry(W, 'att', att);
         } catch (e) {
@@ -693,18 +710,25 @@ export class MailEngine implements WorkloadEngine {
       const next = att.remaining[0];
       if (!next) break;
       try {
-        if (next.size > LARGE_ATTACHMENT_THRESHOLD) {
+        // An upload session must be declared with the exact byte length, and
+        // the metadata size can differ from it (it did by ~150 KB in Graph's
+        // own example), so measure the content when it looks large.
+        const size =
+          next.size > LARGE_ATTACHMENT_THRESHOLD
+            ? ((await this.attachmentLength(ctx, att.srcMsgId, next.id)) ?? next.size)
+            : next.size;
+        if (size > LARGE_ATTACHMENT_THRESHOLD) {
           const session = await dest.post<{ uploadUrl: string }>(
             `${ctx.destUserPath}/messages/${att.destMsgId}/attachments/createUploadSession`,
             {
               AttachmentItem: {
                 attachmentType: 'file',
                 name: next.name ?? 'attachment',
-                size: next.size,
+                size,
               },
             }
           );
-          att.upload = { attId: next.id, sessionUrl: session.uploadUrl, offset: 0, size: next.size, name: next.name };
+          att.upload = { attId: next.id, sessionUrl: session.uploadUrl, offset: 0, size, name: next.name };
           att.remaining.shift();
           store.setCarry(W, 'att', att);
           continue;

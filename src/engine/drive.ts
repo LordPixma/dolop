@@ -394,9 +394,9 @@ export class DriveEngine implements WorkloadEngine {
         }
       }
       const result = await putUploadChunk(up.sessionUrl, bytes, range.start, range.end, up.size);
-      up.offset = range.end + 1;
+      up.offset = result.nextOffset ?? range.end + 1;
       up.downloadUrl = url;
-      report.bytes(W, range.length);
+      if (result.nextOffset === undefined) report.bytes(W, range.length);
       ctx.budget.itemDone();
       if (result.done) {
         const destId = (result.item?.id as string) ?? 'uploaded';

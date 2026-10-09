@@ -11,7 +11,7 @@ import { resumeIndex } from '../src/engine/paged';
 import { TasksEngine } from '../src/engine/tasks';
 import type { PassConfig } from '../src/types';
 import { EngineHarness, FakeGraph, json, pageOf, range, tally } from './support/engine';
-import { calendarTenant, contactsTenant, event, mailbox, mailTenant, tasksTenant } from './support/tenants';
+import { attachmentBytes, calendarTenant, contactsTenant, event, mailbox, mailTenant, tasksTenant } from './support/tenants';
 
 const FULL: PassConfig = { passType: 'full', workloads: ['mail', 'calendar', 'contacts', 'tasks', 'drive'], filters: {} };
 
@@ -380,10 +380,44 @@ describe('mail delta feed', () => {
   });
 });
 
+describe('large mail attachments', () => {
+  const MB = 1024 * 1024;
+  /** Byte-for-byte equality (vitest's deep toEqual is far too slow for megabytes). */
+  const sameBytes = (a: Uint8Array, b: Uint8Array) => a.byteLength === b.byteLength && a.every((v, i) => v === b[i]);
+  const run = async (big: { size: number; content: number; ignoresRange?: boolean }) => {
+    const t = mailTenant(fake, [{ id: 'f-inbox', name: 'Inbox', wellKnown: 'inbox', messages: 1, bigAttachment: { 0: big } }]);
+    const h = new EngineHarness(FULL);
+    await h.run(new MailEngine());
+    return { ...t, h };
+  };
+
+  it('uploads every chunk (Outlook acknowledges intermediate chunks with 200)', async () => {
+    const { created, uploads, uploaded, h } = await run({ size: 10 * MB, content: 10 * MB });
+    expect(created[0]!.attachments).toEqual(['big.bin']);
+    expect(sameBytes(uploaded(uploads[0]!), attachmentBytes(10 * MB))).toBe(true);
+    expect(h.errors).toEqual([]);
+  });
+
+  it('sizes the upload session by the real content length, not the metadata size', async () => {
+    // Graph's metadata size can exceed the content (its own docs show 3,640,066 vs 3,483,322)
+    const { created, uploads, uploaded } = await run({ size: 4_500_000, content: 4_200_000 });
+    expect(uploads[0]!.declared).toBe(4_200_000);
+    expect(created[0]!.attachments).toEqual(['big.bin']);
+    expect(sameBytes(uploaded(uploads[0]!), attachmentBytes(4_200_000))).toBe(true);
+  });
+
+  it('copies correctly when the source ignores Range requests', async () => {
+    const { created, uploads, uploaded } = await run({ size: 9 * MB, content: 9 * MB, ignoresRange: true });
+    expect(created[0]!.attachments).toEqual(['big.bin']);
+    expect(sameBytes(uploaded(uploads[0]!), attachmentBytes(9 * MB))).toBe(true);
+  });
+});
+
 describe('drive engine', () => {
   const MB = 1024 * 1024;
 
-  function oneDrive(files: { name: string; size: number }[]) {
+  function oneDrive(files: { name: string; size: number }[], opts: { loseResponseToPut?: number } = {}) {
+    let puts = 0;
     const items = [
       { id: 'root', root: {} },
       ...files.map((f, i) => ({
@@ -421,10 +455,17 @@ describe('drive engine', () => {
       })
       .route('PUT', /^upload\.test\/(s\d+)$/, (req) => {
         const s = sessions.get(req.m[1]!)!;
+        const start = Number(/bytes (\d+)-/.exec(req.headers.get('content-range') ?? '')?.[1]);
+        if (start < s.received) return json({ error: { code: 'invalidRange' } }, 416); // already have it
         s.received += req.raw?.byteLength ?? 0;
+        if (++puts === opts.loseResponseToPut) return new Response(null, { status: 504 }); // stored, reply lost
         if (s.received < s.size) return json({ nextExpectedRanges: [`${s.received}-`] }, 202);
         uploaded.push(s.name);
         return json({ id: `d-${s.name}` }, 201);
+      })
+      .route('GET', /^upload\.test\/(s\d+)$/, (req) => {
+        const s = sessions.get(req.m[1]!)!;
+        return json({ nextExpectedRanges: [`${s.received}-`] });
       });
     return { uploaded, items };
   }
@@ -463,6 +504,14 @@ describe('drive engine', () => {
     await h.run(new DriveEngine());
     expectEachOnce(uploaded, files.map((f) => f.name));
     expect(h.stats.drive).toMatchObject({ migrated: 1, failed: 0 });
+  });
+
+  it('continues an upload whose chunk was stored but whose response was lost', async () => {
+    const { uploaded } = oneDrive([{ name: 'big.bin', size: 25 * MB }], { loseResponseToPut: 2 });
+    const h = new EngineHarness(FULL);
+    await h.run(new DriveEngine());
+    expect(uploaded).toEqual(['big.bin']);
+    expect(h.errors).toEqual([]);
   });
 
   it('re-copies a large file whose upload was interrupted by a stopped pass', async () => {

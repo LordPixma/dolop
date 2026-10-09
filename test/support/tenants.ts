@@ -42,7 +42,9 @@ export function contactsTenant(fake: FakeGraph, opts: { defaultCount: number; fo
 
 export function calendarTenant(
   fake: FakeGraph,
-  calendars: { id: string; name: string; isDefault?: boolean; events: Partial<GraphEvent>[] }[]
+  calendars: { id: string; name: string; isDefault?: boolean; events: Partial<GraphEvent>[] }[],
+  /** event id → start/end as Graph returns them under Prefer: outlook.timezone="<originalStartTimeZone>" */
+  localTimes: Record<string, Pick<GraphEvent, 'start' | 'end'>> = {}
 ) {
   const created: { calendar: string; subject: string; body: Record<string, any> }[] = [];
   const extensions: string[] = [];
@@ -62,6 +64,12 @@ export function calendarTenant(
     .route('GET', /^\/users\/src\/calendars\/([^/]+)\/events$/, (req) =>
       pageOf(calendars.find((c) => c.id === req.m[1])!.events, req)
     )
+    .route('GET', /^\/users\/src\/events\/([^/]+)$/, (req) => {
+      const ev = calendars.flatMap((c) => c.events).find((e) => e.id === req.m[1])!;
+      const zone = /outlook\.timezone="([^"]+)"/.exec(req.headers.get('prefer') ?? '')?.[1];
+      const local = zone && zone === ev.originalStartTimeZone ? localTimes[ev.id!] : undefined;
+      return json({ id: ev.id, ...(local ?? { start: ev.start, end: ev.end }) });
+    })
     .route('POST', /^\/users\/dst\/calendars\/([^/]+)\/events$/, (req) => {
       created.push({ calendar: req.m[1]!, subject: req.body.subject, body: req.body });
       return json({ id: `de${created.length}` }, 201);

@@ -17,7 +17,8 @@ const W = 'calendar';
 
 const EVENT_SELECT =
   '$select=id,subject,body,start,end,location,attendees,organizer,recurrence,isAllDay,isCancelled,' +
-  'sensitivity,showAs,importance,categories,reminderMinutesBeforeStart,isReminderOn,type';
+  'sensitivity,showAs,importance,categories,reminderMinutesBeforeStart,isReminderOn,type,' +
+  'originalStartTimeZone,originalEndTimeZone';
 
 interface ScanWork {
   srcCalId: string;
@@ -129,7 +130,7 @@ export class CalendarEngine implements WorkloadEngine {
       return;
     }
     try {
-      const { payload, strippedAttendees } = buildEventPayload(ev, {
+      const { payload, strippedAttendees } = buildEventPayload(await this.inOriginalZone(ctx, ev), {
         attendeeMode: ctx.pass.filters.calendarAttendees ?? 'strip',
       });
       const created = await dest.post<{ id: string }>(
@@ -156,6 +157,29 @@ export class CalendarEngine implements WorkloadEngine {
       report.stat(W, 'failed'); // left unmapped, so the next pass retries it
     }
     ctx.budget.itemDone();
+  }
+
+  /**
+   * Graph returns start/end in UTC unless a zone is requested, and a series
+   * created in UTC keeps its UTC time — so after a DST change every
+   * occurrence would sit an hour off. Series masters (and all-day events)
+   * are re-read in the time zone they were created in and created in it.
+   * Single events are absolute times, so UTC is exact for them.
+   */
+  private async inOriginalZone(ctx: MigrationContext, ev: GraphEvent): Promise<GraphEvent> {
+    const zone = ev.originalStartTimeZone;
+    if (ev.type !== 'seriesMaster' && !ev.isAllDay) return ev;
+    if (!zone || zone.startsWith('tzone://') || /^(utc|coordinated universal time)$/i.test(zone)) return ev;
+    try {
+      const local = await ctx.source.get<Pick<GraphEvent, 'start' | 'end'>>(
+        `${ctx.sourceUserPath}/events/${ev.id}?$select=start,end`,
+        { prefer: `outlook.timezone="${zone}"` }
+      );
+      return local.start && local.end ? { ...ev, start: local.start, end: local.end } : ev;
+    } catch (e) {
+      if (!(e instanceof GraphError) || e.name === 'GraphThrottleError') throw e;
+      return ev; // zone not accepted: keep the exact UTC times
+    }
   }
 
   /** Preserve the stripped attendee list on the destination event; a throttle pauses and retries. */

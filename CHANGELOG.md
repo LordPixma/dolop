@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- **Migration engine fixes** (from a full engine review, verified against Microsoft's Graph docs):
+  - OneDrive files are placed by folder id. Delta results carry no paths, so every file
+    used to land in the drive root and same-named files overwrote each other. Folder
+    renames/moves and file moves now carry over. Nested files copied by older versions
+    are re-copied into their folders; their stray copies at the destination root can be
+    deleted.
+  - Mail pre-stage works (Graph rejected its `le` date filter) and received-after passes no
+    longer stop at 5,000 messages; cutoffs are applied client-side.
+  - Large mail attachments (over ~3.75 MB) upload completely and use the exact content
+    length.
+  - Failed items are retried on later passes (up to 3 attempts) instead of being skipped
+    forever; expired delta tokens restart enumeration instead of failing every pass.
+  - Throttling no longer duplicates messages or drops checklist items / attendee lists;
+    a POST is never auto-resent; Graph requests time out; tokens are cached per secret.
+  - Deleted Items / Junk subfolders stay excluded; recurring meetings keep their time zone
+    across DST.
+
 - **Fixed: contacts, calendar events and To Do tasks could be silently skipped.** When a
   tick's budget ran out part-way through a Graph page (always, for contacts: 50-item pages
   vs. a 25-item budget), the rest of that page was never migrated and no error was logged.

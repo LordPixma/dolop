@@ -111,6 +111,36 @@ describe('calendar engine', () => {
     expect(extensions).toHaveLength(60);
   });
 
+  it('creates recurring series in their original time zone, so they keep their local time across DST', async () => {
+    const weekly = { pattern: { type: 'weekly', interval: 1, daysOfWeek: ['monday'] }, range: { type: 'noEnd', startDate: '2026-01-05' } };
+    const events = [
+      event('series', {
+        type: 'seriesMaster',
+        recurrence: weekly,
+        originalStartTimeZone: 'Pacific Standard Time',
+        start: { dateTime: '2026-01-05T17:00:00.0000000', timeZone: 'UTC' },
+        end: { dateTime: '2026-01-05T17:30:00.0000000', timeZone: 'UTC' },
+      }),
+      event('custom', { type: 'seriesMaster', recurrence: weekly, originalStartTimeZone: 'tzone://Microsoft/Custom' }),
+      event('single', { originalStartTimeZone: 'Pacific Standard Time' }),
+    ];
+    const { created } = calendarTenant(fake, [{ id: 'c1', name: 'Calendar', isDefault: true, events }], {
+      series: {
+        start: { dateTime: '2026-01-05T09:00:00.0000000', timeZone: 'Pacific Standard Time' },
+        end: { dateTime: '2026-01-05T09:30:00.0000000', timeZone: 'Pacific Standard Time' },
+      },
+    });
+    const h = new EngineHarness(FULL);
+    await h.run(new CalendarEngine());
+    const bySubject = Object.fromEntries(created.map((c) => [c.subject, c.body]));
+    expect(bySubject['Event series']!.start).toEqual({ dateTime: '2026-01-05T09:00:00.0000000', timeZone: 'Pacific Standard Time' });
+    expect(bySubject['Event series']!.end).toEqual({ dateTime: '2026-01-05T09:30:00.0000000', timeZone: 'Pacific Standard Time' });
+    // a legacy custom zone has no name Graph accepts; a single event is fine as an absolute time
+    expect(bySubject['Event custom']!.start.timeZone).toBe('UTC');
+    expect(bySubject['Event single']!.start.timeZone).toBe('UTC');
+    expect(fake.log.filter((l) => l.startsWith('GET /users/src/events/'))).toEqual(['GET /users/src/events/series']);
+  });
+
   it('does not queue calendars twice when calendar setup is throttled', async () => {
     const cal = (id: string, name: string, isDefault = false) => ({
       id,

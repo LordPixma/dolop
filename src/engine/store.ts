@@ -130,6 +130,10 @@ export class EngineStore {
     );
   }
 
+  mapDel(workload: string, kind: string, src: string): void {
+    this.sql.exec('DELETE FROM idmap WHERE workload = ? AND kind = ? AND src = ?', workload, kind, src);
+  }
+
   mapCount(workload: string, kind: string): number {
     const rows = this.sql
       .exec<{ n: number }>('SELECT COUNT(*) AS n FROM idmap WHERE workload = ? AND kind = ?', workload, kind)

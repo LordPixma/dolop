@@ -311,3 +311,141 @@ export function mailTenant(fake: FakeGraph, folders: SrcMailFolder[]) {
 /** A single inbox with `n` messages (and optional attachments per message index). */
 export const mailbox = (fake: FakeGraph, n: number, attachments: Record<number, number> = {}) =>
   mailTenant(fake, [{ id: 'f-inbox', name: 'Inbox', wellKnown: 'inbox', messages: n, attachments }]);
+
+// ---------------------------------------------------------------------------
+// OneDrive
+
+export interface DriveTree {
+  folders: { id: string; name: string; parent: string }[];
+  files: { id: string; name: string; parent: string; size: number; cTag?: string }[];
+}
+
+/**
+ * A source drive whose delta feed behaves like Graph's: items carry
+ * parentReference.id but never parentReference.path, and (by default)
+ * children are listed before their parent folders. The destination is a
+ * real hierarchy, so tests can assert where every file landed.
+ */
+export function driveTenant(fake: FakeGraph, tree: DriveTree, opts: { loseResponseToPut?: number; parentsFirst?: boolean } = {}) {
+  const srcItem = (id: string): Record<string, unknown> | undefined => {
+    if (id === 'root') return { id: 'root', name: 'root', root: {}, folder: {} };
+    const folder = tree.folders.find((f) => f.id === id);
+    if (folder) return { id, name: folder.name, folder: {}, parentReference: { id: folder.parent } };
+    const file = tree.files.find((f) => f.id === id);
+    if (!file) return undefined;
+    return {
+      id,
+      name: file.name,
+      size: file.size,
+      file: {},
+      cTag: file.cTag ?? `ctag-${id}`,
+      parentReference: { id: file.parent },
+      '@microsoft.graph.downloadUrl': `https://download.test/${id}`,
+    };
+  };
+  const enumeration = () => {
+    const folders = tree.folders.map((f) => srcItem(f.id)!);
+    const files = tree.files.map((f) => srcItem(f.id)!);
+    return opts.parentsFirst ? [srcItem('root')!, ...folders, ...files] : [...files, ...folders.reverse(), srcItem('root')!];
+  };
+  /** Items the next delta round (a request with $deltatoken) reports as changed. */
+  const changes: string[] = [];
+
+  // destination hierarchy
+  const dest = new Map<string, { name: string; parent: string | null; folder: boolean; size?: number }>([
+    ['droot', { name: '', parent: null, folder: true }],
+  ]);
+  let nextId = 0;
+  const childOf = (parent: string, name: string) =>
+    [...dest].find(([, v]) => v.parent === parent && v.name.toLowerCase() === name.toLowerCase())?.[0];
+  const putFile = (parent: string, name: string, size: number) => {
+    const existing = childOf(parent, name);
+    const id = existing ?? `d${nextId++}`;
+    dest.set(id, { name, parent, folder: false, size });
+    return id;
+  };
+  const uploads: string[] = []; // names of files written (direct PUT or completed session)
+  const sessions = new Map<string, { parent: string; name: string; size: number; received: number }>();
+  let puts = 0;
+
+  fake
+    .route('GET', /^\/users\/src\/drive$/, () => json({ id: 'src-drive', quota: { used: 1 } }))
+    .route('GET', /^\/users\/dst\/drive$/, () => json({ id: 'dst-drive' }))
+    .route('GET', /^\/drives\/src-drive\/root\/delta$/, (req) => {
+      if (req.url.searchParams.has('$deltatoken')) {
+        const changed = changes.splice(0).map((id) => srcItem(id)).filter(Boolean);
+        return json({ value: changed, '@odata.deltaLink': req.url.toString() });
+      }
+      return pageOf(enumeration(), req, { delta: true });
+    })
+    .route('GET', /^\/drives\/src-drive\/items\/([^/]+)$/, (req) => {
+      const item = srcItem(req.m[1]!);
+      return item ? json(item) : json({ error: { code: 'itemNotFound' } }, 404);
+    })
+    .route('GET', /^download\.test\/([^/]+)$/, (req) => {
+      const [, start, end] = /bytes=(\d+)-(\d+)/.exec(req.headers.get('range') ?? '') ?? [];
+      return new Response(new Uint8Array(Number(end) - Number(start) + 1), { status: 206 });
+    })
+    .route('GET', /^\/drives\/dst-drive\/root$/, () => json({ id: 'droot' }))
+    .route('POST', /^\/drives\/dst-drive\/items\/([^/]+)\/children$/, (req) => {
+      const parent = req.m[1]!;
+      if (!dest.has(parent)) return json({ error: { code: 'itemNotFound' } }, 404);
+      if (childOf(parent, req.body.name)) return json({ error: { code: 'nameAlreadyExists' } }, 409);
+      const id = `d${nextId++}`;
+      dest.set(id, { name: req.body.name, parent, folder: true });
+      return json({ id, name: req.body.name }, 201);
+    })
+    .route('GET', /^\/drives\/dst-drive\/items\/([^/:]+):\/([^/:]+)$/, (req) => {
+      const id = childOf(req.m[1]!, decodeURIComponent(req.m[2]!));
+      return id ? json({ id }) : json({ error: { code: 'itemNotFound' } }, 404);
+    })
+    .route('PUT', /^\/drives\/dst-drive\/items\/([^/:]+):\/([^/:]+):\/content$/, (req) => {
+      if (!dest.has(req.m[1]!)) return json({ error: { code: 'itemNotFound' } }, 404);
+      const name = decodeURIComponent(req.m[2]!);
+      uploads.push(name);
+      return json({ id: putFile(req.m[1]!, name, req.raw?.byteLength ?? 0) }, 201);
+    })
+    .route('POST', /^\/drives\/dst-drive\/items\/([^/:]+):\/([^/:]+):\/createUploadSession$/, (req) => {
+      if (!dest.has(req.m[1]!)) return json({ error: { code: 'itemNotFound' } }, 404);
+      const name = decodeURIComponent(req.m[2]!);
+      const file = tree.files.find((f) => f.name === name)!;
+      const id = `s${sessions.size}`;
+      sessions.set(id, { parent: req.m[1]!, name, size: file.size, received: 0 });
+      return json({ uploadUrl: `https://upload.test/${id}` });
+    })
+    .route('PUT', /^upload\.test\/(s\d+)$/, (req) => {
+      const s = sessions.get(req.m[1]!)!;
+      const start = Number(/bytes (\d+)-/.exec(req.headers.get('content-range') ?? '')?.[1]);
+      if (start < s.received) return json({ error: { code: 'invalidRange' } }, 416); // already have it
+      s.received += req.raw?.byteLength ?? 0;
+      if (++puts === opts.loseResponseToPut) return new Response(null, { status: 504 }); // stored, reply lost
+      if (s.received < s.size) return json({ nextExpectedRanges: [`${s.received}-`] }, 202);
+      uploads.push(s.name);
+      return json({ id: putFile(s.parent, s.name, s.size) }, 201);
+    })
+    .route('GET', /^upload\.test\/(s\d+)$/, (req) => json({ nextExpectedRanges: [`${sessions.get(req.m[1]!)!.received}-`] }))
+    .route('PATCH', /^\/drives\/dst-drive\/items\/([^/]+)$/, (req) => {
+      const item = dest.get(req.m[1]!);
+      if (!item) return json({ error: { code: 'itemNotFound' } }, 404);
+      if (req.body.name) item.name = req.body.name;
+      if (req.body.parentReference?.id) item.parent = req.body.parentReference.id;
+      return json({ id: req.m[1] });
+    });
+
+  /** Full paths of the destination's files, sorted. */
+  const destFiles = (): string[] => {
+    const path = (id: string): string => {
+      const item = dest.get(id)!;
+      return item.parent === null ? '' : [path(item.parent), item.name].filter(Boolean).join('/');
+    };
+    return [...dest].filter(([, v]) => !v.folder).map(([id]) => path(id)).sort();
+  };
+  /** Delete a destination item and everything under it. */
+  const deleteDest = (id: string) => {
+    for (const [childId, v] of [...dest]) if (v.parent === id) deleteDest(childId);
+    dest.delete(id);
+  };
+  const destIdOf = (path: string) =>
+    path.split('/').reduce<string | undefined>((parent, name) => (parent ? childOf(parent, name) : undefined), 'droot');
+  return { tree, changes, uploads, destFiles, deleteDest, destIdOf };
+}

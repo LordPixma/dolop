@@ -11,7 +11,17 @@ import { resumeIndex } from '../src/engine/paged';
 import { TasksEngine } from '../src/engine/tasks';
 import type { PassConfig } from '../src/types';
 import { EngineHarness, FakeGraph, json, pageOf, range, tally } from './support/engine';
-import { attachmentBytes, calendarTenant, contactsTenant, event, mailbox, mailTenant, tasksTenant } from './support/tenants';
+import {
+  attachmentBytes,
+  calendarTenant,
+  contactsTenant,
+  driveTenant,
+  event,
+  mailbox,
+  mailTenant,
+  tasksTenant,
+  type DriveTree,
+} from './support/tenants';
 
 const FULL: PassConfig = { passType: 'full', workloads: ['mail', 'calendar', 'contacts', 'tasks', 'drive'], filters: {} };
 
@@ -415,122 +425,190 @@ describe('large mail attachments', () => {
 
 describe('drive engine', () => {
   const MB = 1024 * 1024;
-
-  function oneDrive(files: { name: string; size: number }[], opts: { loseResponseToPut?: number } = {}) {
-    let puts = 0;
-    const items = [
-      { id: 'root', root: {} },
-      ...files.map((f, i) => ({
-        id: `f${i}`,
-        name: f.name,
-        size: f.size,
-        file: {},
-        cTag: `ctag-${i}`,
-        parentReference: { path: '/drive/root:' },
-        '@microsoft.graph.downloadUrl': `https://download.test/f${i}`,
-      })),
-    ];
-    const uploaded: string[] = []; // completed destination files, by name
-    const sessions = new Map<string, { name: string; size: number; received: number }>();
-    fake
-      .route('GET', /^\/users\/src\/drive$/, () => json({ id: 'src-drive', quota: { used: 1 } }))
-      .route('GET', /^\/users\/dst\/drive$/, () => json({ id: 'dst-drive' }))
-      .route('GET', /^\/drives\/src-drive\/root\/delta$/, (req) => pageOf(items, req, { delta: true }))
-      .route('GET', /^\/drives\/dst-drive\/root$/, () => json({ id: 'droot' }))
-      .route('GET', /^\/drives\/src-drive\/items\/([^/]+)$/, (req) => json(items.find((x) => x.id === req.m[1])))
-      .route('GET', /^download\.test\/(f\d+)$/, (req) => {
-        const [, start, end] = /bytes=(\d+)-(\d+)/.exec(req.headers.get('range') ?? '') ?? [];
-        return new Response(new Uint8Array(Number(end) - Number(start) + 1), { status: 206 });
-      })
-      .route('PUT', /^\/drives\/dst-drive\/items\/droot:\/([^/:]+):\/content$/, (req) => {
-        uploaded.push(decodeURIComponent(req.m[1]!));
-        return json({ id: `d-${req.m[1]}` }, 201);
-      })
-      .route('PATCH', /^\/drives\/dst-drive\/items\/[^/]+$/, () => json({}))
-      .route('POST', /^\/drives\/dst-drive\/items\/droot:\/([^/:]+):\/createUploadSession$/, (req) => {
-        const id = `s${sessions.size}`;
-        const file = files.find((f) => f.name === decodeURIComponent(req.m[1]!))!;
-        sessions.set(id, { name: file.name, size: file.size, received: 0 });
-        return json({ uploadUrl: `https://upload.test/${id}` });
-      })
-      .route('PUT', /^upload\.test\/(s\d+)$/, (req) => {
-        const s = sessions.get(req.m[1]!)!;
-        const start = Number(/bytes (\d+)-/.exec(req.headers.get('content-range') ?? '')?.[1]);
-        if (start < s.received) return json({ error: { code: 'invalidRange' } }, 416); // already have it
-        s.received += req.raw?.byteLength ?? 0;
-        if (++puts === opts.loseResponseToPut) return new Response(null, { status: 504 }); // stored, reply lost
-        if (s.received < s.size) return json({ nextExpectedRanges: [`${s.received}-`] }, 202);
-        uploaded.push(s.name);
-        return json({ id: `d-${s.name}` }, 201);
-      })
-      .route('GET', /^upload\.test\/(s\d+)$/, (req) => {
-        const s = sessions.get(req.m[1]!)!;
-        return json({ nextExpectedRanges: [`${s.received}-`] });
-      });
-    return { uploaded, items };
-  }
-
-  it('does not lose queued files when a pass stops mid-page', async () => {
-    const files = range(150).map((i) => ({ name: `file${i}.txt`, size: 10 }));
-    const { uploaded } = oneDrive(files); // delta pages of 100, 25 files per tick
-    const h = new EngineHarness(FULL);
-    await h.run(new DriveEngine(), { until: () => uploaded.length >= 40 });
-    h.newPass();
-    await h.run(new DriveEngine());
-    expectEachOnce(uploaded, files.map((f) => f.name));
+  const flat = (n: number, size = 10): DriveTree => ({
+    folders: [],
+    files: range(n).map((i) => ({ id: `f${i}`, name: `file${i}.txt`, parent: 'root', size })),
+  });
+  const docs = (): DriveTree => ({
+    folders: [
+      { id: 'fd', name: 'Docs', parent: 'root' },
+      { id: 'fr', name: 'Reports', parent: 'fd' },
+      { id: 'fp', name: 'Photos', parent: 'root' },
+    ],
+    files: [
+      { id: 'a', name: 'a.txt', parent: 'fd', size: 10 },
+      { id: 'q1', name: 'q1.txt', parent: 'fr', size: 10 },
+      { id: 'top', name: 'top.txt', parent: 'root', size: 10 },
+      { id: 'p', name: 'p.jpg', parent: 'fp', size: 10 },
+    ],
   });
 
-  it('re-enumerates when the delta token has expired', async () => {
-    const files = range(3).map((i) => ({ name: `file${i}.txt`, size: 10 }));
-    const { uploaded, items } = oneDrive(files);
+  it('does not lose queued files when a pass stops mid-page', async () => {
+    const tree = flat(150);
+    const { uploads } = driveTenant(fake, tree); // delta pages of 100, 25 files per tick
     const h = new EngineHarness(FULL);
-    await h.run(new DriveEngine());
-    items.push({ ...items[1]!, id: 'f-new', name: 'new.txt', cTag: 'ctag-new' } as (typeof items)[number]);
-    fake.fail('GET', /^\/drives\/src-drive\/root\/delta$/, { status: 410 });
+    await h.run(new DriveEngine(), { until: () => uploads.length >= 40 });
     h.newPass();
     await h.run(new DriveEngine());
-    expectEachOnce(uploaded, [...files.map((f) => f.name), 'new.txt']);
+    expectEachOnce(uploads, tree.files.map((f) => f.name));
   });
 
   it('copies a file that failed on the next pass', async () => {
-    const files = range(4).map((i) => ({ name: `file${i}.txt`, size: 10 }));
-    const { uploaded } = oneDrive(files);
+    const tree = flat(4);
+    const { uploads } = driveTenant(fake, tree);
     fake.fail('PUT', /file2\.txt:\/content$/, { times: 2 }); // the client's one retry fails too
     const h = new EngineHarness(FULL);
     await h.run(new DriveEngine());
-    expect(uploaded.sort()).toEqual(['file0.txt', 'file1.txt', 'file3.txt']);
+    expect(uploads.sort()).toEqual(['file0.txt', 'file1.txt', 'file3.txt']);
     expect(h.stats.drive).toMatchObject({ migrated: 3, failed: 1 });
     h.newPass();
     await h.run(new DriveEngine());
-    expectEachOnce(uploaded, files.map((f) => f.name));
+    expectEachOnce(uploads, tree.files.map((f) => f.name));
     expect(h.stats.drive).toMatchObject({ migrated: 1, failed: 0 });
   });
 
-  it('continues an upload whose chunk was stored but whose response was lost', async () => {
-    const { uploaded } = oneDrive([{ name: 'big.bin', size: 25 * MB }], { loseResponseToPut: 2 });
+  it('re-enumerates when the delta token has expired', async () => {
+    const tree = flat(3);
+    const { uploads } = driveTenant(fake, tree);
     const h = new EngineHarness(FULL);
     await h.run(new DriveEngine());
-    expect(uploaded).toEqual(['big.bin']);
+    tree.files.push({ id: 'f-new', name: 'new.txt', parent: 'root', size: 10 });
+    fake.fail('GET', /^\/drives\/src-drive\/root\/delta$/, { status: 410 });
+    h.newPass();
+    await h.run(new DriveEngine());
+    expectEachOnce(uploads, tree.files.map((f) => f.name));
+  });
+
+  it('continues an upload whose chunk was stored but whose response was lost', async () => {
+    const { uploads } = driveTenant(fake, { folders: [], files: [{ id: 'b', name: 'big.bin', parent: 'root', size: 25 * MB }] }, {
+      loseResponseToPut: 2,
+    });
+    const h = new EngineHarness(FULL);
+    await h.run(new DriveEngine());
+    expect(uploads).toEqual(['big.bin']);
     expect(h.errors).toEqual([]);
   });
 
   it('re-copies a large file whose upload was interrupted by a stopped pass', async () => {
-    const files = [
-      { name: 'small.txt', size: 10 },
-      { name: 'big.bin', size: 25 * MB }, // three 10 MiB chunks
-    ];
-    const { uploaded } = oneDrive(files);
+    const tree: DriveTree = {
+      folders: [],
+      files: [
+        { id: 's', name: 'small.txt', parent: 'root', size: 10 },
+        { id: 'b', name: 'big.bin', parent: 'root', size: 25 * MB }, // three 10 MiB chunks
+      ],
+    };
+    const { uploads, destFiles } = driveTenant(fake, tree, { parentsFirst: true });
     fake.throttle('PUT', /^upload\.test\/s0$/, { after: 1 }); // first chunk lands, second is throttled
     const h = new EngineHarness(FULL);
     const engine = new DriveEngine();
     let outcome;
     for (let i = 0; i < 10 && outcome !== 'throttled'; i++) outcome = await h.tick(engine);
     expect(outcome).toBe('throttled');
-    expect(uploaded).toEqual(['small.txt']);
+    expect(uploads).toEqual(['small.txt']);
     // the pass is stopped mid-upload, then a new pass starts
     h.newPass();
     await h.run(engine);
-    expect(uploaded.sort()).toEqual(['big.bin', 'small.txt']);
+    expect(destFiles()).toEqual(['big.bin', 'small.txt']);
     expect(h.errors).toEqual([]);
+  });
+
+  describe('folder structure (delta results carry no paths)', () => {
+    it('puts every file in its folder, even when files are listed before their folders', async () => {
+      const { destFiles } = driveTenant(fake, docs());
+      const h = new EngineHarness(FULL);
+      await h.run(new DriveEngine());
+      expect(destFiles()).toEqual(['Docs/Reports/q1.txt', 'Docs/a.txt', 'Photos/p.jpg', 'top.txt']);
+    });
+
+    it('keeps same-named files in different folders apart', async () => {
+      const { destFiles } = driveTenant(fake, {
+        folders: [
+          { id: 'fa', name: 'A', parent: 'root' },
+          { id: 'fb', name: 'B', parent: 'root' },
+        ],
+        files: [
+          { id: 'ra', name: 'report.txt', parent: 'fa', size: 10 },
+          { id: 'rb', name: 'report.txt', parent: 'fb', size: 10 },
+        ],
+      });
+      const h = new EngineHarness(FULL);
+      await h.run(new DriveEngine());
+      expect(destFiles()).toEqual(['A/report.txt', 'B/report.txt']);
+    });
+
+    it('excludes folders by path', async () => {
+      const { destFiles } = driveTenant(fake, docs());
+      const h = new EngineHarness({ ...FULL, filters: { driveExcludePaths: ['docs/reports'] } });
+      await h.run(new DriveEngine());
+      expect(destFiles()).toEqual(['Docs/a.txt', 'Photos/p.jpg', 'top.txt']);
+    });
+
+    it('renames the destination folder when the source folder is renamed', async () => {
+      const { tree, changes, uploads, destFiles } = driveTenant(fake, docs());
+      const h = new EngineHarness(FULL);
+      await h.run(new DriveEngine());
+      // delta reports only the renamed folder, not its contents
+      tree.folders.find((f) => f.id === 'fd')!.name = 'Documents';
+      tree.files.push({ id: 'b', name: 'b.txt', parent: 'fd', size: 10 });
+      changes.push('fd', 'b');
+      h.newPass({ ...FULL, passType: 'delta' });
+      await h.run(new DriveEngine());
+      expect(destFiles()).toEqual([
+        'Documents/Reports/q1.txt',
+        'Documents/a.txt',
+        'Documents/b.txt',
+        'Photos/p.jpg',
+        'top.txt',
+      ]);
+      expect(uploads.filter((n) => n === 'a.txt')).toHaveLength(1);
+    });
+
+    it('moves the destination file when the source file is moved', async () => {
+      const { tree, changes, uploads, destFiles } = driveTenant(fake, docs());
+      const h = new EngineHarness(FULL);
+      await h.run(new DriveEngine());
+      tree.files.find((f) => f.id === 'a')!.parent = 'fp';
+      changes.push('a');
+      h.newPass({ ...FULL, passType: 'delta' });
+      await h.run(new DriveEngine());
+      expect(destFiles()).toEqual(['Docs/Reports/q1.txt', 'Photos/a.txt', 'Photos/p.jpg', 'top.txt']);
+      expect(uploads.filter((n) => n === 'a.txt')).toHaveLength(1); // moved, not uploaded again
+    });
+
+    it('recreates a destination folder that was deleted and copies new files into it', async () => {
+      const { tree, changes, destFiles, deleteDest, destIdOf } = driveTenant(fake, docs());
+      const h = new EngineHarness(FULL);
+      await h.run(new DriveEngine());
+      deleteDest(destIdOf('Docs')!);
+      tree.files.push({ id: 'n', name: 'new.txt', parent: 'fd', size: 10 });
+      changes.push('n');
+      h.newPass({ ...FULL, passType: 'delta' });
+      await h.run(new DriveEngine());
+      expect(destFiles()).toContain('Docs/new.txt');
+      expect(h.stats.drive).toMatchObject({ migrated: 1, failed: 0, skipped: 0 });
+    });
+
+    it('recreates a whole deleted folder chain for a new file deep inside it', async () => {
+      const { tree, changes, destFiles, deleteDest, destIdOf } = driveTenant(fake, docs());
+      const h = new EngineHarness(FULL);
+      await h.run(new DriveEngine());
+      deleteDest(destIdOf('Docs')!); // takes Docs/Reports with it
+      tree.files.push({ id: 'n', name: 'new.txt', parent: 'fr', size: 10 });
+      changes.push('n');
+      h.newPass({ ...FULL, passType: 'delta' });
+      await h.run(new DriveEngine());
+      expect(destFiles()).toContain('Docs/Reports/new.txt');
+      expect(h.stats.drive).toMatchObject({ migrated: 1, failed: 0 });
+    });
+
+    it('re-copies nested files that older versions put at the root, and keeps true root files', async () => {
+      const { uploads, destFiles } = driveTenant(fake, docs());
+      const h = new EngineHarness(FULL);
+      // id-map entries written by the path-based version ("<destId>|<cTag>")
+      for (const id of ['a', 'q1', 'p', 'top']) h.store.mapPut('drive', 'item', id, `old-${id}|ctag-${id}`);
+      await h.run(new DriveEngine());
+      expect(uploads.sort()).toEqual(['a.txt', 'p.jpg', 'q1.txt']); // top.txt was already in the right place
+      expect(destFiles()).toEqual(['Docs/Reports/q1.txt', 'Docs/a.txt', 'Photos/p.jpg']);
+    });
   });
 });

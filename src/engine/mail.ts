@@ -135,6 +135,12 @@ export class MailEngine implements WorkloadEngine {
         : `${ctx.sourceUserPath}/mailFolders`;
       const children = await source.listAll<MailFolder>(`${listPath}?$top=200`);
 
+      // Follow-up work is queued only once every child is resolved: a throttle
+      // part-way through re-runs this enum item, which would otherwise queue
+      // the earlier children's scans (and count their items) a second time.
+      const enums: EnumWork[] = [];
+      const scans: ScanWork[] = [];
+      let expected = 0;
       for (const child of children) {
         const childPath = path ? `${path}/${child.displayName}` : child.displayName;
         const wellKnownName = srcWkById.get(child.id);
@@ -144,9 +150,12 @@ export class MailEngine implements WorkloadEngine {
           isPathExcluded(childPath, ctx.pass.filters.excludeFolders) ||
           (ctx.pass.filters.excludeDeletedItems !== false && wellKnownName === 'deleteditems') ||
           (ctx.pass.filters.excludeJunk !== false && wellKnownName === 'junkemail');
+        // Nor its subfolders: e.g. folders deleted into Deleted Items would
+        // otherwise be recreated at the top of the destination mailbox.
+        if (excluded) continue;
 
         let destId = store.mapGet(W, 'folder', child.id);
-        if (!destId && !excluded) {
+        if (!destId) {
           try {
             destId = await this.resolveDestFolder(ctx, child, wellKnownName, dstWk, destParentId);
             store.mapPut(W, 'folder', child.id, destId);
@@ -167,26 +176,21 @@ export class MailEngine implements WorkloadEngine {
           }
         }
         if (child.childFolderCount > 0) {
-          store.pushWork(W, 'enum', {
-            srcFolderId: child.id,
-            destParentId: destId,
-            path: childPath,
-          } satisfies EnumWork);
+          enums.push({ srcFolderId: child.id, destParentId: destId, path: childPath });
         }
-        if (!excluded && destId) {
-          store.pushWork(W, 'scan', {
-            srcFolderId: child.id,
-            destFolderId: destId,
-            path: childPath,
-            asDraft: wellKnownName === 'drafts',
-          } satisfies ScanWork);
-          // Folder item counts give progress bars a real denominator. Delta
-          // passes only see new items, so the full count would mislead there.
-          if (ctx.pass.passType !== 'delta') {
-            ctx.report.expected(W, child.totalItemCount);
-          }
-        }
+        scans.push({
+          srcFolderId: child.id,
+          destFolderId: destId,
+          path: childPath,
+          asDraft: wellKnownName === 'drafts',
+        });
+        // Folder item counts give progress bars a real denominator. Delta
+        // passes only see new items, so the full count would mislead there.
+        if (ctx.pass.passType !== 'delta') expected += child.totalItemCount;
       }
+      for (const e of enums) store.pushWork(W, 'enum', e);
+      for (const s of scans) store.pushWork(W, 'scan', s);
+      if (expected > 0) report.expected(W, expected);
       store.popWork(work.id);
     }
     return 'continue';

@@ -52,6 +52,9 @@ export class TasksEngine implements WorkloadEngine {
     const dstDefault = dstLists.find((l) => l.wellknownListName === 'defaultList');
     const dstByName = new Map(dstLists.map((l) => [(l.displayName ?? '').toLowerCase(), l.id]));
 
+    // Scans are queued only once every list is resolved, so a throttle
+    // part-way through (which re-runs this phase) can't queue one twice.
+    const scans: ScanWork[] = [];
     for (const list of srcLists) {
       if (list.wellknownListName === 'flaggedEmails') continue; // system-generated view
       let destId = store.mapGet(W, 'list', list.id);
@@ -84,12 +87,9 @@ export class TasksEngine implements WorkloadEngine {
         }
         store.mapPut(W, 'list', list.id, destId);
       }
-      store.pushWork(W, 'scan', {
-        srcListId: list.id,
-        destListId: destId,
-        name: list.displayName ?? '',
-      } satisfies ScanWork);
+      scans.push({ srcListId: list.id, destListId: destId, name: list.displayName ?? '' });
     }
+    for (const s of scans) store.pushWork(W, 'scan', s);
     store.setPhase(W, 'items');
     return 'continue';
   }

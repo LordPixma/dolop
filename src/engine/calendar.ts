@@ -44,6 +44,9 @@ export class CalendarEngine implements WorkloadEngine {
     ]);
     const dstByName = new Map(dstCals.map((c) => [(c.name ?? '').toLowerCase(), c.id]));
 
+    // Scans are queued only once every calendar is resolved, so a throttle
+    // part-way through (which re-runs this phase) can't queue one twice.
+    const scans: ScanWork[] = [];
     for (const cal of srcCals) {
       let destId = store.mapGet(W, 'cal', cal.id);
       if (!destId) {
@@ -75,8 +78,9 @@ export class CalendarEngine implements WorkloadEngine {
         }
         store.mapPut(W, 'cal', cal.id, destId);
       }
-      store.pushWork(W, 'scan', { srcCalId: cal.id, destCalId: destId, name: cal.name ?? '' } satisfies ScanWork);
+      scans.push({ srcCalId: cal.id, destCalId: destId, name: cal.name ?? '' });
     }
+    for (const s of scans) store.pushWork(W, 'scan', s);
     store.setPhase(W, 'items');
     return 'continue';
   }

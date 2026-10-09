@@ -11,6 +11,7 @@ import { resumeIndex } from '../src/engine/paged';
 import { TasksEngine } from '../src/engine/tasks';
 import type { PassConfig } from '../src/types';
 import { EngineHarness, FakeGraph, json, pageOf, range, tally } from './support/engine';
+import { calendarTenant, contactsTenant, event, mailbox, mailTenant, tasksTenant } from './support/tenants';
 
 const FULL: PassConfig = { passType: 'full', workloads: ['mail', 'calendar', 'contacts', 'tasks', 'drive'], filters: {} };
 
@@ -53,29 +54,16 @@ describe('resumeIndex', () => {
 });
 
 describe('contacts engine', () => {
-  function contactsTenant(n: number) {
-    const source = range(n).map((i) => ({ id: `c${i}`, givenName: `Contact ${i}` }));
-    const created: string[] = [];
-    fake
-      .route('GET', /^\/users\/(src|dst)\/contactFolders$/, () => json({ value: [] }))
-      .route('GET', /^\/users\/src\/contacts$/, (req) => pageOf(source, req))
-      .route('POST', /^\/users\/dst\/contacts$/, (req) => {
-        created.push(req.body.givenName);
-        return json({ id: `dc${created.length}` }, 201);
-      });
-    return { source, created };
-  }
-
   it('migrates every contact although pages are larger than the per-tick item budget', async () => {
-    const { source, created } = contactsTenant(120);
+    const { all, created } = contactsTenant(fake, { defaultCount: 120 });
     const h = new EngineHarness(FULL);
     await h.run(new ContactsEngine());
-    expectEachOnce(created, source.map((c) => c.givenName));
+    expectEachOnce(created.map((c) => c.name), all);
     expect(h.stats.contacts).toMatchObject({ discovered: 120, migrated: 120, skipped: 0, failed: 0 });
   });
 
   it('re-walks an already migrated folder on the next pass without copying again', async () => {
-    const { created } = contactsTenant(120);
+    const { created } = contactsTenant(fake, { defaultCount: 120 });
     const h = new EngineHarness(FULL);
     await h.run(new ContactsEngine());
     h.newPass();
@@ -85,72 +73,83 @@ describe('contacts engine', () => {
     // id-map skips cost no Graph calls, so they don't eat the per-tick item budget
     expect(ticks).toBeLessThanOrEqual(3);
   });
+
+  it('does not queue folders twice when folder setup is throttled', async () => {
+    const { all, created, destFolders } = contactsTenant(fake, {
+      defaultCount: 4,
+      folders: [
+        { name: 'Friends', count: 4 },
+        { name: 'Work', count: 4 },
+      ],
+    });
+    fake.throttle('POST', /^\/users\/dst\/contactFolders$/, { after: 1 });
+    const h = new EngineHarness(FULL);
+    await h.run(new ContactsEngine());
+    expectEachOnce(created.map((c) => c.name), all);
+    expect(destFolders).toEqual(['Friends', 'Work']);
+    expect(h.stats.contacts).toMatchObject({ discovered: 12, migrated: 12, skipped: 0 });
+  });
 });
 
 describe('calendar engine', () => {
   it('resumes mid-page when the subrequest budget runs out', async () => {
-    const source = range(60).map((i) => ({
-      id: `e${i}`,
-      subject: `Event ${i}`,
-      type: 'singleInstance',
-      start: { dateTime: '2026-01-01T09:00:00', timeZone: 'UTC' },
-      end: { dateTime: '2026-01-01T10:00:00', timeZone: 'UTC' },
-      attendees: [{ emailAddress: { address: 'x@y.test' } }], // stripped → extension call per event
-    }));
-    const created: string[] = [];
-    let extensions = 0;
-    fake
-      .route('GET', /^\/users\/src\/calendar$/, () => json({ id: 'cal-src' }))
-      .route('GET', /^\/users\/dst\/calendar$/, () => json({ id: 'cal-dst' }))
-      .route('GET', /^\/users\/src\/calendars$/, () => json({ value: [{ id: 'cal-src', name: 'Calendar', isDefaultCalendar: true }] }))
-      .route('GET', /^\/users\/dst\/calendars$/, () => json({ value: [{ id: 'cal-dst', name: 'Calendar' }] }))
-      .route('GET', /^\/users\/src\/calendars\/cal-src\/events$/, (req) => pageOf(source, req))
-      .route('POST', /^\/users\/dst\/calendars\/cal-dst\/events$/, (req) => {
-        created.push(req.body.subject);
-        return json({ id: `de${created.length}` }, 201);
-      })
-      .route('POST', /^\/users\/dst\/events\/[^/]+\/extensions$/, () => {
-        extensions++;
-        return json({}, 201);
-      });
-
-    const h = new EngineHarness(FULL, { maxSubrequests: 11 });
+    const events = range(60).map((i) => event(`e${i}`, { attendees: [{ emailAddress: { address: 'x@y.test' } }] }));
+    const { created, extensions } = calendarTenant(fake, [{ id: 'cal-src', name: 'Calendar', isDefault: true, events }]);
+    const h = new EngineHarness(FULL, { maxSubrequests: 11 }); // stripped attendees → extension call per event
     await h.run(new CalendarEngine());
-    expectEachOnce(created, source.map((e) => e.subject));
-    expect(extensions).toBe(60);
+    expectEachOnce(created.map((c) => c.subject), events.map((e) => e.subject!));
+    expect(extensions).toHaveLength(60);
+  });
+
+  it('does not queue calendars twice when calendar setup is throttled', async () => {
+    const cal = (id: string, name: string, isDefault = false) => ({
+      id,
+      name,
+      isDefault,
+      events: range(4).map((i) => event(`${id}-${i}`)),
+    });
+    const calendars = [cal('c1', 'Calendar', true), cal('c2', 'Team'), cal('c3', 'Holidays')];
+    const { created, destCalendars } = calendarTenant(fake, calendars);
+    fake.throttle('POST', /^\/users\/dst\/calendars$/, { after: 1 });
+    const h = new EngineHarness(FULL);
+    await h.run(new CalendarEngine());
+    expectEachOnce(created.map((c) => c.subject), calendars.flatMap((c) => c.events.map((e) => e.subject!)));
+    expect(destCalendars).toEqual(['Team', 'Holidays']);
+    expect(h.stats.calendar).toMatchObject({ discovered: 12, migrated: 12, skipped: 0 });
   });
 });
 
 describe('tasks engine', () => {
-  it('resumes mid-page when checklist items use up the subrequest budget', async () => {
-    const source = range(40).map((i) => ({
-      id: `t${i}`,
-      title: `Task ${i}`,
-      checklistItems: range(3).map((j) => ({ displayName: `Step ${i}.${j}` })),
-    }));
-    const created: string[] = [];
-    const checklist: string[] = [];
-    fake
-      .route('GET', /^\/users\/src\/todo\/lists$/, () =>
-        json({ value: [{ id: 'l-src', displayName: 'Tasks', wellknownListName: 'defaultList' }] })
-      )
-      .route('GET', /^\/users\/dst\/todo\/lists$/, () =>
-        json({ value: [{ id: 'l-dst', displayName: 'Tasks', wellknownListName: 'defaultList' }] })
-      )
-      .route('GET', /^\/users\/src\/todo\/lists\/l-src\/tasks$/, (req) => pageOf(source, req))
-      .route('POST', /^\/users\/dst\/todo\/lists\/l-dst\/tasks$/, (req) => {
-        created.push(req.body.title);
-        return json({ id: `dt${created.length}` }, 201);
-      })
-      .route('POST', /^\/users\/dst\/todo\/lists\/l-dst\/tasks\/[^/]+\/checklistItems$/, (req) => {
-        checklist.push(req.body.displayName);
-        return json({}, 201);
-      });
+  const task = (id: string, steps = 0) => ({
+    id,
+    title: `Task ${id}`,
+    checklistItems: range(steps).map((j) => ({ id: `${id}-s${j}`, displayName: `Step ${id}.${j}` })),
+  });
 
+  it('resumes mid-page when checklist items use up the subrequest budget', async () => {
+    const tasks = range(40).map((i) => task(`t${i}`, 3));
+    const { created, checklist } = tasksTenant(fake, [{ id: 'l1', name: 'Tasks', isDefault: true, tasks }]);
     const h = new EngineHarness(FULL); // 25-task pages × 4 calls each overrun 80 subrequests
     await h.run(new TasksEngine());
-    expectEachOnce(created, source.map((t) => t.title));
-    expectEachOnce(checklist, source.flatMap((t) => t.checklistItems.map((c) => c.displayName)));
+    expectEachOnce(created.map((t) => t.title), tasks.map((t) => t.title));
+    expectEachOnce(checklist.map((c) => c.name), tasks.flatMap((t) => t.checklistItems.map((c) => c.displayName)));
+  });
+
+  it('does not queue lists twice when list setup is throttled', async () => {
+    const list = (id: string, name: string, isDefault = false) => ({
+      id,
+      name,
+      isDefault,
+      tasks: range(3).map((i) => task(`${id}-${i}`)),
+    });
+    const lists = [list('l1', 'Tasks', true), list('l2', 'Groceries'), list('l3', 'Chores')];
+    const { created, destLists } = tasksTenant(fake, lists);
+    fake.throttle('POST', /^\/users\/dst\/todo\/lists$/, { after: 1 });
+    const h = new EngineHarness(FULL);
+    await h.run(new TasksEngine());
+    expectEachOnce(created.map((t) => t.title), lists.flatMap((l) => l.tasks.map((t) => t.title)));
+    expect(destLists).toEqual(['Groceries', 'Chores']);
+    expect(h.stats.tasks).toMatchObject({ discovered: 9, migrated: 9, skipped: 0 });
   });
 });
 
@@ -158,59 +157,18 @@ describe('tasks engine', () => {
 // Delta engines: a pass that stops mid-page must not lose that page
 
 describe('mail engine', () => {
-  function mailbox(n: number, attachments: Record<string, number> = {}) {
-    const source = range(n).map((i) => ({
-      id: `m${i}`,
-      subject: `Message ${i}`,
-      receivedDateTime: '2026-01-01T00:00:00Z',
-      body: { contentType: 'text', content: 'hello' },
-      hasAttachments: (attachments[`m${i}`] ?? 0) > 0,
-    }));
-    const created: { id: string; subject: string; attachments: string[] }[] = [];
-    fake
-      .route('GET', /^\/users\/src\/mailFolders\/inbox$/, () =>
-        json({ id: 'f-src', displayName: 'Inbox', childFolderCount: 0, totalItemCount: n })
-      )
-      .route('GET', /^\/users\/dst\/mailFolders\/inbox$/, () => json({ id: 'f-dst', displayName: 'Inbox' }))
-      .route('GET', /^\/users\/src\/mailFolders$/, () =>
-        json({ value: [{ id: 'f-src', displayName: 'Inbox', childFolderCount: 0, totalItemCount: n }] })
-      )
-      .route('GET', /^\/users\/src\/mailFolders\/f-src\/messages\/delta$/, (req) =>
-        pageOf(source.map((m) => ({ id: m.id })), req, { delta: true })
-      )
-      .route('GET', /^\/users\/src\/messages\/([^/]+)\/attachments$/, (req) =>
-        json({
-          value: range(attachments[req.m[1]!] ?? 0).map((j) => ({ id: `${req.m[1]}-a${j}`, name: `file${j}.txt`, size: 5 })),
-        })
-      )
-      .route('GET', /^\/users\/src\/messages\/([^/]+)\/attachments\/([^/]+)$/, (req) =>
-        json({ '@odata.type': '#microsoft.graph.fileAttachment', id: req.m[2], name: `${req.m[2]}.txt`, contentBytes: 'aGVsbG8=' })
-      )
-      .route('GET', /^\/users\/src\/messages\/([^/]+)$/, (req) => json(source.find((m) => m.id === req.m[1])))
-      .route('POST', /^\/users\/dst\/mailFolders\/f-dst\/messages$/, (req) => {
-        const id = `dm${created.length}`;
-        created.push({ id, subject: req.body.subject, attachments: [] });
-        return json({ id }, 201);
-      })
-      .route('POST', /^\/users\/dst\/messages\/([^/]+)\/attachments$/, (req) => {
-        created.find((c) => c.id === req.m[1])!.attachments.push(req.body.name);
-        return json({ id: 'att' }, 201);
-      });
-    return { source, created };
-  }
-
   it('does not lose the rest of a page when a pass stops mid-page', async () => {
-    const { source, created } = mailbox(100); // delta pages of 40, 25 messages per tick
+    const { allMessages, created } = mailbox(fake, 100); // delta pages of 40, 25 messages per tick
     const h = new EngineHarness(FULL);
     await h.run(new MailEngine(), { until: () => created.length >= 50 }); // stopped inside page 2
     h.newPass();
     await h.run(new MailEngine());
-    expectEachOnce(created.map((c) => c.subject), source.map((m) => m.subject));
+    expectEachOnce(created.map((c) => c.subject), allMessages.map((m) => m.subject));
   });
 
   it('finishes a half-copied message on the next pass instead of duplicating it', async () => {
-    const { source, created } = mailbox(10, { m3: 2 });
-    fake.throttle('POST', /^\/users\/dst\/messages\/[^/]+\/attachments$/, { after: 1 }); // m3's second attachment
+    const { allMessages, created } = mailbox(fake, 10, { 3: 2 });
+    fake.throttle('POST', /^\/users\/dst\/messages\/[^/]+\/attachments$/, { after: 1 }); // its second attachment
     const h = new EngineHarness(FULL);
     const engine = new MailEngine();
     let outcome;
@@ -219,8 +177,37 @@ describe('mail engine', () => {
     // the pass is stopped here, then a new pass starts
     h.newPass();
     await h.run(engine);
-    expectEachOnce(created.map((c) => c.subject), source.map((m) => m.subject));
-    expect(created.find((c) => c.subject === 'Message 3')!.attachments.sort()).toEqual(['m3-a0.txt', 'm3-a1.txt']);
+    expectEachOnce(created.map((c) => c.subject), allMessages.map((m) => m.subject));
+    expect(created.find((c) => c.subject === 'Inbox 3')!.attachments.sort()).toEqual([
+      'f-inbox-m3-a0.txt',
+      'f-inbox-m3-a1.txt',
+    ]);
+  });
+
+  it('keeps subfolders of an excluded Deleted Items folder out of the mailbox', async () => {
+    const { messages, created, destFolders } = mailTenant(fake, [
+      { id: 'f-inbox', name: 'Inbox', wellKnown: 'inbox', messages: 3 },
+      { id: 'f-deleted', name: 'Deleted Items', wellKnown: 'deleteditems', messages: 2 },
+      { id: 'f-old', name: 'Project X', parent: 'f-deleted', messages: 4 },
+    ]);
+    const h = new EngineHarness(FULL);
+    await h.run(new MailEngine());
+    expectEachOnce(created.map((c) => c.subject), messages.get('f-inbox')!.map((m) => m.subject));
+    expect([...destFolders.values()].map((f) => f.name)).not.toContain('Project X');
+  });
+
+  it('does not queue folders twice when folder setup is throttled', async () => {
+    const { allMessages, created, destFolders } = mailTenant(fake, [
+      { id: 'f-inbox', name: 'Inbox', wellKnown: 'inbox', messages: 5 },
+      { id: 'f-a', name: 'Alpha', messages: 3 },
+      { id: 'f-b', name: 'Beta', messages: 3 },
+    ]);
+    fake.throttle('POST', /^\/users\/dst\/mailFolders$/, { after: 1 }); // Beta's creation
+    const h = new EngineHarness(FULL);
+    await h.run(new MailEngine());
+    expectEachOnce(created.map((c) => c.subject), allMessages.map((m) => m.subject));
+    expect([...destFolders.values()].filter((f) => f.name === 'Beta')).toHaveLength(1);
+    expect(h.stats.mail).toMatchObject({ expected: 11, discovered: 11, migrated: 11 });
   });
 });
 

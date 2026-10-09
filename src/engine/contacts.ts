@@ -26,7 +26,9 @@ export class ContactsEngine implements WorkloadEngine {
 
   private async folders(ctx: MigrationContext): Promise<StepResult> {
     const { store, source, dest, report } = ctx;
-    store.pushWork(W, 'scan', { srcPath: '/contacts', destPath: '/contacts', name: 'Contacts' } satisfies ScanWork);
+    // Scans are queued only once every folder is resolved, so a throttle
+    // part-way through (which re-runs this phase) can't queue one twice.
+    const scans: ScanWork[] = [{ srcPath: '/contacts', destPath: '/contacts', name: 'Contacts' }];
 
     const [srcFolders, dstFolders] = await Promise.all([
       source.listAll<GraphContactFolder>(`${ctx.sourceUserPath}/contactFolders?$top=100`),
@@ -61,12 +63,13 @@ export class ContactsEngine implements WorkloadEngine {
         }
         store.mapPut(W, 'folder', f.id, destId);
       }
-      store.pushWork(W, 'scan', {
+      scans.push({
         srcPath: `/contactFolders/${f.id}/contacts`,
         destPath: `/contactFolders/${destId}/contacts`,
         name: f.displayName ?? '',
-      } satisfies ScanWork);
+      });
     }
+    for (const s of scans) store.pushWork(W, 'scan', s);
     store.setPhase(W, 'items');
     return 'continue';
   }

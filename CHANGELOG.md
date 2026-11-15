@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Device migration.** A new Devices tab inventories the source tenant's devices (Entra ID,
+  Intune, Autopilot, Windows LAPS), pairs them with migration users, suggests a plan for each
+  and checks readiness. It backs up BitLocker recovery keys (encrypted), removes devices from
+  Autopilot, stores the destination provisioning package and deletes source records after the
+  move. The new dolop agent (PowerShell, run on the device) moves a Windows device joined to
+  Entra ID to the destination tenant without a wipe, handing the user's existing profile to
+  their new account, with automatic rollback if the profile step or leaving the source tenant
+  fails. The source connector needs five more permissions; see `docs/devices.md`.
+- **Fixed: Verify could fail with `Authorization_RequestDenied` for up to an hour after admin
+  consent.** A token issued before Microsoft finished applying the consented permissions was
+  cached and reused. Such tokens are no longer cached, Verify always gets a fresh token, and a
+  403 now says which permissions are missing.
+
 - **Migration engine fixes** (from a full engine review, verified against Microsoft's Graph docs):
   - OneDrive files are placed by folder id. Delta results carry no paths, so every file
     used to land in the drive root and same-named files overwrote each other. Folder

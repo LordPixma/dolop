@@ -117,6 +117,28 @@ class TestKV {
   }
 }
 
+/** In-memory R2 bucket: put/get/head/delete with custom metadata. */
+export class TestR2 {
+  readonly objects = new Map<string, { bytes: Uint8Array; customMetadata: Record<string, string>; uploaded: Date }>();
+  async put(key: string, value: ArrayBuffer | string, opts: { customMetadata?: Record<string, string> } = {}) {
+    const bytes = typeof value === 'string' ? new TextEncoder().encode(value) : new Uint8Array(value.slice(0));
+    this.objects.set(key, { bytes, customMetadata: opts.customMetadata ?? {}, uploaded: new Date() });
+    return {};
+  }
+  async head(key: string) {
+    const o = this.objects.get(key);
+    return o ? { key, size: o.bytes.byteLength, customMetadata: o.customMetadata, uploaded: o.uploaded } : null;
+  }
+  async get(key: string) {
+    const o = this.objects.get(key);
+    if (!o) return null;
+    return { ...(await this.head(key)), body: new Blob([o.bytes]).stream() };
+  }
+  async delete(key: string): Promise<void> {
+    this.objects.delete(key);
+  }
+}
+
 /** Durable Object namespace stub: records every fetch, answers {ok:true}. */
 class TestDONamespace {
   readonly calls: { name: string; path: string; body: string }[] = [];
@@ -137,6 +159,7 @@ export interface TestEnv {
   env: Env;
   db: TestD1;
   kv: TestKV;
+  r2: TestR2;
   queue: QueueMessage[];
   orchestrator: TestDONamespace;
   coordinator: TestDONamespace;
@@ -148,13 +171,14 @@ export const TEST_API_TOKEN = 'test-api-token';
 export function makeEnv(overrides: Partial<Env> = {}, db = new TestD1()): TestEnv {
   if (db.rows("SELECT name FROM sqlite_master WHERE name = 'accounts'").length === 0) db.migrate();
   const kv = new TestKV();
+  const r2 = new TestR2();
   const queue: QueueMessage[] = [];
   const orchestrator = new TestDONamespace();
   const coordinator = new TestDONamespace();
   const env = {
     DB: db,
     KV: kv,
-    R2: { put: async () => undefined },
+    R2: r2,
     MIGRATION_QUEUE: { send: async (m: QueueMessage) => void queue.push(m) },
     ORCHESTRATOR: orchestrator,
     COORDINATOR: coordinator,
@@ -163,5 +187,5 @@ export function makeEnv(overrides: Partial<Env> = {}, db = new TestD1()): TestEn
     API_TOKEN: TEST_API_TOKEN,
     ...overrides,
   } as unknown as Env;
-  return { env, db, kv, queue, orchestrator, coordinator };
+  return { env, db, kv, r2, queue, orchestrator, coordinator };
 }

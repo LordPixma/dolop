@@ -26,7 +26,8 @@ M365 moves, and where the honest gaps are.
 
 | Area | Status | Notes / workaround |
 | --- | --- | --- |
-| **DeploymentPro (Outlook profile reconfiguration)** | ❌ out of scope | No cloud API can rewrite local Outlook profiles. Use Intune/Autopilot, GPO, or documented manual steps post-cutover. |
+| **Device migration** (moving Windows devices between tenants) | ✅ Windows joined to Entra ID | The dolop agent moves the device without a wipe and keeps the user's profile; Office/OneDrive re-prompt for the new account. Hybrid-joined devices, Macs and phones are inventoried but moved by hand. See [devices.md](devices.md). |
+| **DeploymentPro (Outlook profile reconfiguration)** | ⚠️ partial | The device agent clears Office's cached sign-in so Outlook prompts for the new account, but the Outlook profile itself is not rewritten: create a new profile for the new mailbox. |
 | **In-place (online) archive mailboxes** | ❌ | Microsoft Graph cannot reach online archives (EWS-only). Expand/export archives separately if needed. |
 | Recurring event **exceptions** (modified single occurrences) | ⚠️ | Series masters migrate with full recurrence; individually-modified occurrences are not recreated. |
 | Event **organizer** | ⚠️ | Graph sets the organizer to the destination mailbox owner; original organizer/attendees preserved in the `com.dolop.migration` open extension. Attendees stripped by default to avoid invitation storms (configurable). |

@@ -2,6 +2,11 @@
 
 import type {
   Connector,
+  Device,
+  DeviceAgentReport,
+  DeviceInventory,
+  DevicePlan,
+  DeviceStatus,
   ItemError,
   MigrationUser,
   PassConfig,
@@ -304,6 +309,7 @@ export async function deleteProject(db: D1Database, id: string): Promise<void> {
     db.prepare('DELETE FROM item_errors WHERE project_id = ?').bind(id),
     db.prepare('DELETE FROM events WHERE project_id = ?').bind(id),
     db.prepare('DELETE FROM migration_users WHERE project_id = ?').bind(id),
+    db.prepare('DELETE FROM devices WHERE project_id = ?').bind(id),
     db.prepare('DELETE FROM projects WHERE id = ?').bind(id),
   ]);
 }
@@ -707,6 +713,7 @@ export async function logEvent(
   data: {
     projectId?: string;
     userId?: string;
+    deviceId?: string;
     level?: 'info' | 'warn' | 'error';
     message: string;
     data?: unknown;
@@ -714,11 +721,12 @@ export async function logEvent(
 ): Promise<void> {
   await db
     .prepare(
-      'INSERT INTO events (project_id, user_id, level, message, data, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+      'INSERT INTO events (project_id, user_id, device_id, level, message, data, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
     )
     .bind(
       data.projectId ?? null,
       data.userId ?? null,
+      data.deviceId ?? null,
       data.level ?? 'info',
       data.message,
       data.data !== undefined ? JSON.stringify(data.data) : null,
@@ -737,4 +745,296 @@ export async function listEvents(
     .bind(projectId, Math.min(opts.limit ?? 100, 500))
     .all();
   return results;
+}
+
+export async function listDeviceEvents(
+  db: D1Database,
+  deviceId: string,
+  limit = 100
+): Promise<{ id: number; level: string; message: string; data: unknown; createdAt: string }[]> {
+  const { results } = await db
+    .prepare('SELECT id, level, message, data, created_at FROM events WHERE device_id = ? ORDER BY id DESC LIMIT ?')
+    .bind(deviceId, Math.min(limit, 500))
+    .all<{ id: number; level: string; message: string; data: string | null; created_at: string }>();
+  return results.map((r) => ({
+    id: r.id,
+    level: r.level,
+    message: r.message,
+    data: parseJson<unknown>(r.data, null),
+    createdAt: r.created_at,
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// Devices
+
+interface DeviceRow {
+  id: string;
+  project_id: string;
+  source_key: string;
+  name: string;
+  entra_object_id: string | null;
+  entra_device_id: string | null;
+  intune_device_id: string | null;
+  autopilot_id: string | null;
+  os: string | null;
+  os_version: string | null;
+  trust_type: string | null;
+  serial_number: string | null;
+  model: string | null;
+  owner_upn: string | null;
+  user_id: string | null;
+  last_activity_at: string | null;
+  registered_at: string | null;
+  laps_backed_up: number | null;
+  inventory: string;
+  plan: string;
+  plan_overridden: number;
+  status: string;
+  step: string | null;
+  detail: string | null;
+  agent_token_hash: string | null;
+  agent_token_expires_at: string | null;
+  agent_last_seen_at: string | null;
+  agent_report: string | null;
+  source_sid: string | null;
+  dest_sid: string | null;
+  bitlocker_enc: string | null;
+  bitlocker_count: number;
+  bitlocker_backed_up_at: string | null;
+  missing_since: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+function rowToDevice(r: DeviceRow): Device {
+  return {
+    id: r.id,
+    projectId: r.project_id,
+    sourceKey: r.source_key,
+    name: r.name,
+    entraObjectId: r.entra_object_id ?? undefined,
+    entraDeviceId: r.entra_device_id ?? undefined,
+    intuneDeviceId: r.intune_device_id ?? undefined,
+    autopilotId: r.autopilot_id ?? undefined,
+    os: r.os ?? undefined,
+    osVersion: r.os_version ?? undefined,
+    trustType: r.trust_type ?? undefined,
+    serialNumber: r.serial_number ?? undefined,
+    model: r.model ?? undefined,
+    ownerUpn: r.owner_upn ?? undefined,
+    userId: r.user_id ?? undefined,
+    lastActivityAt: r.last_activity_at ?? undefined,
+    registeredAt: r.registered_at ?? undefined,
+    lapsBackedUp: r.laps_backed_up === null ? undefined : r.laps_backed_up === 1,
+    inventory: parseJson<DeviceInventory>(r.inventory, {}),
+    plan: r.plan as DevicePlan,
+    planOverridden: r.plan_overridden === 1,
+    status: r.status as DeviceStatus,
+    step: r.step ?? undefined,
+    detail: r.detail ?? undefined,
+    agentTokenExpiresAt: r.agent_token_hash ? (r.agent_token_expires_at ?? undefined) : undefined,
+    agentLastSeenAt: r.agent_last_seen_at ?? undefined,
+    agentReport: parseJson<DeviceAgentReport | undefined>(r.agent_report, undefined),
+    sourceSid: r.source_sid ?? undefined,
+    destSid: r.dest_sid ?? undefined,
+    bitlockerCount: r.bitlocker_count ?? 0,
+    bitlockerBackedUpAt: r.bitlocker_backed_up_at ?? undefined,
+    missingSince: r.missing_since ?? undefined,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+/** Inventory facts discovered in the source tenant for one device. */
+export interface DeviceInventoryRow {
+  sourceKey: string;
+  name: string;
+  entraObjectId?: string;
+  entraDeviceId?: string;
+  intuneDeviceId?: string;
+  autopilotId?: string;
+  os?: string;
+  osVersion?: string;
+  trustType?: string;
+  serialNumber?: string;
+  model?: string;
+  ownerUpn?: string;
+  userId?: string;
+  lastActivityAt?: string;
+  registeredAt?: string;
+  lapsBackedUp?: boolean;
+  inventory: DeviceInventory;
+  suggestedPlan: DevicePlan;
+}
+
+/**
+ * Merge a discovery run into the project's device list. Inventory fields are
+ * refreshed; the plan is only replaced when the operator has not overridden
+ * it; devices no longer in the source tenant are flagged, never deleted (their
+ * migration history and BitLocker keys must survive).
+ */
+export async function upsertDiscoveredDevices(
+  db: D1Database,
+  projectId: string,
+  rows: DeviceInventoryRow[]
+): Promise<{ added: number; updated: number; missing: number }> {
+  const now = nowIso();
+  const existing = new Map(
+    (await listDevices(db, projectId)).map((d) => [d.sourceKey, d] as const)
+  );
+  const stmts: D1PreparedStatement[] = [];
+  let added = 0;
+  let updated = 0;
+  const seen = new Set<string>();
+  for (const r of rows) {
+    seen.add(r.sourceKey);
+    const values = [
+      r.name,
+      r.entraObjectId ?? null,
+      r.entraDeviceId ?? null,
+      r.intuneDeviceId ?? null,
+      r.autopilotId ?? null,
+      r.os ?? null,
+      r.osVersion ?? null,
+      r.trustType ?? null,
+      r.serialNumber ?? null,
+      r.model ?? null,
+      r.ownerUpn?.toLowerCase() ?? null,
+      r.userId ?? null,
+      r.lastActivityAt ?? null,
+      r.registeredAt ?? null,
+      r.lapsBackedUp === undefined ? null : r.lapsBackedUp ? 1 : 0,
+      JSON.stringify(r.inventory),
+    ];
+    const prev = existing.get(r.sourceKey);
+    if (prev) {
+      updated++;
+      stmts.push(
+        db
+          .prepare(
+            `UPDATE devices SET name = ?, entra_object_id = ?, entra_device_id = ?, intune_device_id = ?,
+             autopilot_id = ?, os = ?, os_version = ?, trust_type = ?, serial_number = ?, model = ?,
+             owner_upn = ?, user_id = COALESCE(?, user_id), last_activity_at = ?, registered_at = ?,
+             laps_backed_up = ?, inventory = ?,
+             plan = CASE WHEN plan_overridden = 1 THEN plan ELSE ? END,
+             missing_since = NULL, updated_at = ? WHERE id = ?`
+          )
+          .bind(...values, r.suggestedPlan, now, prev.id)
+      );
+    } else {
+      added++;
+      stmts.push(
+        db
+          .prepare(
+            `INSERT INTO devices (name, entra_object_id, entra_device_id, intune_device_id, autopilot_id,
+             os, os_version, trust_type, serial_number, model, owner_upn, user_id, last_activity_at,
+             registered_at, laps_backed_up, inventory, plan, id, project_id, source_key, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .bind(...values, r.suggestedPlan, newId('dev'), projectId, r.sourceKey, now, now)
+      );
+    }
+  }
+  let missing = 0;
+  for (const d of existing.values()) {
+    if (seen.has(d.sourceKey)) continue;
+    missing++;
+    if (!d.missingSince) {
+      stmts.push(
+        db.prepare('UPDATE devices SET missing_since = ?, updated_at = ? WHERE id = ?').bind(now, now, d.id)
+      );
+    }
+  }
+  if (stmts.length) await db.batch(stmts);
+  return { added, updated, missing };
+}
+
+export async function listDevices(db: D1Database, projectId: string): Promise<Device[]> {
+  const { results } = await db
+    .prepare('SELECT * FROM devices WHERE project_id = ? ORDER BY name COLLATE NOCASE, id')
+    .bind(projectId)
+    .all<DeviceRow>();
+  return results.map(rowToDevice);
+}
+
+export async function getDevice(db: D1Database, id: string): Promise<Device | null> {
+  const row = await db.prepare('SELECT * FROM devices WHERE id = ?').bind(id).first<DeviceRow>();
+  return row ? rowToDevice(row) : null;
+}
+
+/** Look up a device by the SHA-256 of its agent token (only unexpired tokens match). */
+export async function getDeviceByAgentToken(db: D1Database, tokenHash: string): Promise<Device | null> {
+  const row = await db
+    .prepare('SELECT * FROM devices WHERE agent_token_hash = ? AND agent_token_expires_at > ?')
+    .bind(tokenHash, nowIso())
+    .first<DeviceRow>();
+  return row ? rowToDevice(row) : null;
+}
+
+/** Encrypted BitLocker key blob for a device (kept out of the Device shape on purpose). */
+export async function getDeviceBitLockerEnc(db: D1Database, id: string): Promise<string | null> {
+  const row = await db
+    .prepare('SELECT bitlocker_enc FROM devices WHERE id = ?')
+    .bind(id)
+    .first<{ bitlocker_enc: string | null }>();
+  return row?.bitlocker_enc ?? null;
+}
+
+const DEVICE_COLUMNS = {
+  userId: 'user_id',
+  autopilotId: 'autopilot_id',
+  plan: 'plan',
+  planOverridden: 'plan_overridden',
+  status: 'status',
+  step: 'step',
+  detail: 'detail',
+  agentTokenHash: 'agent_token_hash',
+  agentTokenExpiresAt: 'agent_token_expires_at',
+  agentLastSeenAt: 'agent_last_seen_at',
+  agentReport: 'agent_report',
+  sourceSid: 'source_sid',
+  destSid: 'dest_sid',
+  bitlockerEnc: 'bitlocker_enc',
+  bitlockerCount: 'bitlocker_count',
+  bitlockerBackedUpAt: 'bitlocker_backed_up_at',
+  intuneDeviceId: 'intune_device_id',
+  entraObjectId: 'entra_object_id',
+} as const;
+
+export type DevicePatch = {
+  userId?: string | null;
+  autopilotId?: string | null;
+  plan?: DevicePlan;
+  planOverridden?: boolean;
+  status?: DeviceStatus;
+  step?: string | null;
+  detail?: string | null;
+  agentTokenHash?: string | null;
+  agentTokenExpiresAt?: string | null;
+  agentLastSeenAt?: string | null;
+  agentReport?: DeviceAgentReport | null;
+  sourceSid?: string | null;
+  destSid?: string | null;
+  bitlockerEnc?: string | null;
+  bitlockerCount?: number;
+  bitlockerBackedUpAt?: string | null;
+  intuneDeviceId?: string | null;
+  entraObjectId?: string | null;
+};
+
+export async function updateDevice(db: D1Database, id: string, patch: DevicePatch): Promise<void> {
+  const sets: string[] = ['updated_at = ?'];
+  const binds: unknown[] = [nowIso()];
+  for (const [key, column] of Object.entries(DEVICE_COLUMNS) as [keyof DevicePatch, string][]) {
+    const value = patch[key];
+    if (value === undefined) continue;
+    sets.push(`${column} = ?`);
+    if (typeof value === 'boolean') binds.push(value ? 1 : 0);
+    else if (key === 'agentReport') binds.push(value === null ? null : JSON.stringify(value));
+    else if (key === 'detail' && typeof value === 'string') binds.push(value.slice(0, 2000));
+    else binds.push(value);
+  }
+  binds.push(id);
+  await db.prepare(`UPDATE devices SET ${sets.join(', ')} WHERE id = ?`).bind(...binds).run();
 }

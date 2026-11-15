@@ -32,6 +32,10 @@ A practical sequence for moving an acquired organisation from tenant A (source) 
    source. If forwarded copies don't appear, allow external auto-forwarding on the source
    tenant's outbound spam policy — see [coexistence.md](coexistence.md).
 
+10. **Devices** (optional): on the Devices tab, *Sync from source tenant*, back up BitLocker keys,
+    remove devices from Autopilot, upload the destination provisioning package and run the
+    agent's **Check** on each Windows device you'll move — see [devices.md](devices.md).
+
 ## Cutover weekend
 
 9. **Final full pass**: *Start a pass → Full* with all workloads. Thanks to the id map and
@@ -47,7 +51,10 @@ A practical sequence for moving an acquired organisation from tenant A (source) 
 13. **Final delta pass** after mail flow switches, catching anything delivered during the
     change window. Run Rules & settings last so auto-replies/rules land after mailboxes are
     complete.
-14. **Reports**: download the user + error CSVs (also archived in R2) for the project record.
+14. **Devices**: once users' mail and OneDrive are in the destination, schedule each device's
+    migration with its agent command (evenings work well: add `-ForceLogoff`). Devices restart
+    themselves; users sign in with their new accounts. Then *Delete from source tenant*.
+15. **Reports**: download the user + error CSVs (also archived in R2) for the project record.
 
 ## Aftercare
 
@@ -55,6 +62,6 @@ A practical sequence for moving an acquired organisation from tenant A (source) 
 - Leave **coexistence** running (now Destination → Source) while a handful of people still rely
   on the old tenant; on the Coexistence tab click **Disable all** once you're confident the
   source tenant can be retired.
-- Reconfigure Outlook/OneDrive clients (the equivalent of BitTitan DeploymentPro) with
-  Intune/Autopilot or documented manual steps — see
-  [bittitan-parity.md](bittitan-parity.md) for what client-side work remains.
+- Windows devices moved by the dolop agent re-prompt Office and OneDrive for the new account;
+  users still create a new Outlook profile. Re-enroll Macs and phones by hand. See
+  [devices.md](devices.md) and [bittitan-parity.md](bittitan-parity.md).

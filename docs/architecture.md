@@ -12,7 +12,7 @@ unit — a Worker — plus the data services it binds to.
 | Migration engine | Durable Objects (SQLite) | `MigrationOrchestrator` — one per (project, user); `ProjectCoordinator` — one per project |
 | Fan-out | Queues (`dolop-migrations`) | start requests flow API → queue → coordinator, with retries + DLQ |
 | Token cache | KV | app-only Graph tokens per tenant/app, TTL'd to expiry−5 min |
-| Artifacts | R2 | CSV report archive |
+| Artifacts | R2 | CSV report archive; each project's destination provisioning package (device migration) |
 | Scheduling | Cron trigger (15 min) | auto-delta passes; watchdog that re-arms stalled orchestrators |
 
 ## The orchestrator tick loop
@@ -86,5 +86,8 @@ any user still *running* with a heartbeat older than 10 minutes gets its orchest
 - Admin-consent callback: HMAC-signed state; a tenant is bound in at most one workspace, and
   with several workspaces the tenant id is taken from an OIDC ID token rather than the
   redirect's unsigned `tenant` parameter.
+- Device agent: per-device bearer tokens (SHA-256 stored, expiring, revoked on completion) on
+  the public `/api/agent/*` routes; BitLocker keys AES-256-GCM encrypted like client secrets.
+  See [devices.md](devices.md).
 - Graph access is app-only; consider Exchange application access policies to scope the app
   to in-scope mailboxes (see setup guide).

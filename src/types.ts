@@ -256,3 +256,100 @@ export interface CoordinatorEnqueueBody {
   maxConcurrent: number;
   users: { userId: string; pass: PassConfig }[];
 }
+
+// ---------------------------------------------------------------------------
+// Device migration
+
+/**
+ * What to do with a source device:
+ * - 'migrate': move it to the destination tenant with the dolop agent (no wipe).
+ * - 'manual': not agent-eligible (registered-only, macOS, mobile): re-register by hand.
+ * - 'cleanup': stale or duplicate record; delete it from the source tenant.
+ * - 'ignore': leave it alone.
+ */
+export type DevicePlan = 'migrate' | 'manual' | 'cleanup' | 'ignore';
+
+export const DEVICE_PLANS: DevicePlan[] = ['migrate', 'manual', 'cleanup', 'ignore'];
+
+export type DeviceStatus =
+  | 'discovered'
+  | 'agent_issued'
+  | 'checked'
+  | 'check_failed'
+  | 'scheduled'
+  | 'migrating'
+  | 'joined'
+  | 'completed'
+  | 'failed'
+  | 'cleaned_up';
+
+/** Raw inventory facts kept for display and readiness checks. */
+export interface DeviceInventory {
+  inEntra?: boolean;
+  inIntune?: boolean;
+  accountEnabled?: boolean;
+  complianceState?: string;
+  managementAgent?: string;
+  enrollmentType?: string;
+  ownerType?: string;
+  manufacturer?: string;
+}
+
+/** What the agent last reported about the device and the user's profile. */
+export interface DeviceAgentReport {
+  phase?: string;
+  checks?: { name: string; status: 'ok' | 'warn' | 'fail'; detail?: string }[];
+  agentVersion?: string;
+  osBuild?: string;
+  profilePath?: string;
+  scheduledFor?: string;
+  backupPath?: string;
+  [key: string]: unknown;
+}
+
+export interface Device {
+  id: string;
+  projectId: string;
+  sourceKey: string;
+  name: string;
+  entraObjectId?: string;
+  entraDeviceId?: string;
+  intuneDeviceId?: string;
+  autopilotId?: string;
+  os?: string;
+  osVersion?: string;
+  trustType?: string;
+  serialNumber?: string;
+  model?: string;
+  ownerUpn?: string;
+  userId?: string;
+  lastActivityAt?: string;
+  registeredAt?: string;
+  lapsBackedUp?: boolean;
+  inventory: DeviceInventory;
+  plan: DevicePlan;
+  planOverridden: boolean;
+  status: DeviceStatus;
+  step?: string;
+  detail?: string;
+  agentTokenExpiresAt?: string;
+  agentLastSeenAt?: string;
+  agentReport?: DeviceAgentReport;
+  sourceSid?: string;
+  destSid?: string;
+  bitlockerCount: number;
+  bitlockerBackedUpAt?: string;
+  missingSince?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** A BitLocker recovery key as stored (encrypted) by dolop. */
+export interface BitLockerKeyRecord {
+  /** Key protector id (Entra recovery key id, or the protector GUID the agent reported). */
+  id: string;
+  key: string;
+  volumeType?: string;
+  createdAt?: string;
+  source: 'entra' | 'agent';
+}

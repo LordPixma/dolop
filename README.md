@@ -6,9 +6,10 @@
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Cloudflare Workers](https://img.shields.io/badge/runs%20on-Cloudflare%20Workers-f38020)](https://workers.cloudflare.com/)
 
-Dolop migrates user accounts between Microsoft 365 tenants — the job commercial tools charge per-user licences for — using nothing but the Cloudflare developer platform and the Microsoft Graph API. No servers, no VMs, no agents: the entire
+Dolop migrates user accounts between Microsoft 365 tenants — the job commercial tools charge per-user licences for — using nothing but the Cloudflare developer platform and the Microsoft Graph API. No servers, no VMs: the entire
 migration engine runs in Workers and Durable Objects, and you self-host it on your own
-Cloudflare account for pennies.
+Cloudflare account for pennies. (The one exception is optional: moving a Windows device to
+the new tenant runs a small PowerShell agent on that device.)
 
 Built for **M&A scenarios**: assess, provision, pre-stage weeks ahead, keep tenants in sync
 with delta passes, then cut over with minimal user disruption.
@@ -28,6 +29,7 @@ with delta passes, then cut over with minimal user disruption.
 | **OneDrive** | Full drive via delta enumeration, folder structure, timestamps; files of any size streamed in 10 MiB chunks (never buffered whole); changed files re-copied on delta passes via cTag comparison |
 | **Rules & settings** | Inbox rules (folder ids remapped), Outlook master categories, mailbox settings (auto-reply, time zone, working hours, locale) |
 | **Coexistence** | Mail dual-delivery: a managed forwarding rule keeps both mailboxes fed so mail to one address is received in both tenants — one direction at a time (no loops), flipped at cutover, off when you retire the other tenant |
+| **Devices** | Inventory of the source tenant's devices (Entra ID, Intune, Autopilot, LAPS) with readiness checks and BitLocker key backup; the **dolop agent** moves Windows devices joined to Entra ID to the new tenant **without a wipe**, keeping each user's Windows profile ([details](docs/devices.md)) |
 | **Provisioning** | Create destination accounts in bulk with one-time passwords and license assignment (SKU picker) |
 | **Assessment** | Pre-migration sizing (mailbox item counts, OneDrive usage) and destination readiness checks — writes nothing |
 | **Tenant onboarding** | BitTitan-style **admin consent links**: one multi-tenant app, a Global Admin clicks approve, the connector binds itself — or manual per-tenant app registrations if preferred |
@@ -122,6 +124,7 @@ migrations, ensures queues exist, and syncs optional `DOLOP_*` secrets).
 | --- | --- |
 | [Setup guide](docs/setup.md) | Entra app registrations (consent-link & manual modes), permissions, Cloudflare provisioning |
 | [M&A runbook](docs/runbook.md) | Step-by-step cutover playbook, from assessment to aftercare |
+| [Device migration](docs/devices.md) | Moving Windows devices to the new tenant without a wipe: permissions, the provisioning package, what the agent does, recovery |
 | [Coexistence](docs/coexistence.md) | Mail dual-delivery during the overlap window: how forwarding works, direction at cutover, the external-forwarding caveat |
 | [Architecture](docs/architecture.md) | Engine internals, tick budgets, idempotency model, security |
 | [FAQ](docs/faq.md) | Costs, speed, data handling, comparisons, troubleshooting |

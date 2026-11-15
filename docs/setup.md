@@ -68,6 +68,12 @@ races service-principal propagation, click **Verify** a minute later.
    | `Sites.Read.All` | drive metadata lookups |
    | `User.ReadWrite.All` *(destination only)* | provisioning destination accounts + license assignment |
 
+   **Device migration** (optional, source tenant only) needs five more permissions:
+   `Device.ReadWrite.All`, `DeviceManagementManagedDevices.ReadWrite.All`,
+   `DeviceManagementServiceConfig.ReadWrite.All`, `BitLockerKey.Read.All` and
+   `DeviceLocalCredential.ReadBasic.All`. See [devices.md](devices.md) for what each is used
+   for and what happens without it.
+
    A pure **source** tenant can be granted the `.Read` variants instead
    (`Mail.Read`, `Calendars.Read`, `Contacts.Read`, `Tasks.Read.All`, `Files.Read.All`,
    `MailboxSettings.Read`) — dolop only reads from the source. Granting the ReadWrite set in

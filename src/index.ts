@@ -2,8 +2,10 @@
 // and cron handler (auto-delta scheduling + stalled-migration watchdog).
 
 import { Hono } from 'hono';
+import { agentApi } from './api/agent';
 import { authApi } from './api/auth';
 import { coexistenceApi } from './api/coexistence';
+import { devicesApi } from './api/devices';
 import { consentApi } from './api/consent';
 import { connectorsApi } from './api/connectors';
 import { ApiError } from './api/helpers';
@@ -26,6 +28,9 @@ app.get('/api/health', (c) => c.json({ ok: true, service: 'dolop' }));
 // Admin-consent return leg (public; authenticated by its signed state).
 app.route('/api/consent', consentApi);
 
+// Device agent (public; authenticated by its per-device token).
+app.route('/api/agent', agentApi);
+
 // Auth routes manage their own access rules (login/setup must be public).
 app.route('/api/auth', authApi);
 
@@ -35,6 +40,7 @@ app.route('/api/projects', projectsApi);
 app.route('/api/projects', usersApi);
 app.route('/api/projects', migrationsApi);
 app.route('/api/projects', coexistenceApi);
+app.route('/api/projects', devicesApi);
 app.route('/api/projects', reportsApi);
 
 app.onError((err, c) => {

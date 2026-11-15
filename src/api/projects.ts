@@ -12,6 +12,7 @@ import {
 } from '../db';
 import type { AppEnv, Env, Project, WorkloadStats } from '../types';
 import { nowIso } from '../util';
+import { packageKey } from './devices';
 import { ApiError, loadProject, sanitizeSettings } from './helpers';
 
 export const projectsApi = new Hono<AppEnv>();
@@ -177,5 +178,7 @@ projectsApi.delete('/:projectId', async (c) => {
     throw new ApiError(409, 'stop all migrations before deleting the project');
   }
   await deleteProject(c.env.DB, project.id);
+  // The provisioning package holds a destination enrollment token: don't orphan it.
+  await c.env.R2.delete(packageKey(project.id)).catch(() => undefined);
   return c.json({ ok: true });
 });

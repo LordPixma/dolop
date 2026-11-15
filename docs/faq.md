@@ -82,6 +82,11 @@ pass.
 Yes — add them as users in scope (they resolve like any mailbox via Graph). Note mailbox
 *permissions/delegates* are not migrated; re-grant those in the destination.
 
+### Can it move devices to the new tenant?
+Windows devices joined to Entra ID, yes, without a wipe: the dolop agent hands the user's
+existing Windows profile to their new account and joins the device to the destination
+tenant. Other devices are inventoried for manual handling. See [devices.md](devices.md).
+
 ### What can't it migrate?
 Read [bittitan-parity.md](bittitan-parity.md). Headlines: Outlook profile reconfiguration
 (use Intune/GPO), in-place archive mailboxes (Graph can't reach them), recurring-event

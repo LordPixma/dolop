@@ -757,6 +757,7 @@ async function renderProject(projectId, tab) {
     if (tab === 'users') await tabUsers(content, project);
     else if (tab === 'migrate') await tabMigrate(content, project);
     else if (tab === 'coexistence') await tabCoexistence(content, project);
+    else if (tab === 'devices') await tabDevices(content, project);
     else if (tab === 'errors') await tabErrors(content, project);
     else if (tab === 'events') await tabEvents(content, project);
     else await tabSettings(content, project, data);
@@ -766,7 +767,7 @@ async function renderProject(projectId, tab) {
     const prevSelAll = document.getElementById('sel-all')?.checked ?? false;
     const scrollY = window.scrollY;
 
-    const tabs = ['users', 'migrate', 'coexistence', 'errors', 'events', 'settings'];
+    const tabs = ['users', 'migrate', 'coexistence', 'devices', 'errors', 'events', 'settings'];
     $app.innerHTML = `
       <div class="page-head">
         <div>
@@ -810,7 +811,7 @@ async function viewProject(projectId, tab = 'users') {
     if (e.message !== 'unauthorized') $app.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
     return;
   }
-  if (tab === 'users' || tab === 'migrate') {
+  if (tab === 'users' || tab === 'migrate' || tab === 'devices') {
     pollTimer = setInterval(async () => {
       if (document.getElementById('modal-root').innerHTML !== '') return; // don't refresh under a modal
       if (!location.hash.startsWith(`#/projects/${projectId}`)) { stopPolling(); return; }
@@ -1382,6 +1383,262 @@ async function tabCoexistence(c, project) {
   c.querySelector('#cx-disable-sel').addEventListener('click', () => run('disable', selected()));
   c.querySelector('#cx-disable-all').addEventListener('click', () => {
     if (confirm('Remove the coexistence forwarding rule from every user?')) run('disable', eligibleOff.length ? eligibleOff : allIds);
+  });
+}
+
+// -- Devices tab ----------------------------------------------------------------
+
+const PLAN_LABELS = { migrate: 'Migrate', manual: 'Manual', cleanup: 'Clean up', ignore: 'Ignore' };
+const JOIN_LABELS = { AzureAd: 'Entra joined', Workplace: 'Registered', ServerAd: 'Hybrid joined' };
+const CHECK_ICONS = { ok: '✓', warn: '!', fail: '✗', pending: '…' };
+
+function joinLabel(d) {
+  if (!d.inventory || d.inventory.inEntra === false) return 'Intune record only';
+  return JOIN_LABELS[d.trustType] || d.trustType || '—';
+}
+
+function readinessCell(d) {
+  if (d.plan !== 'migrate') return '<span class="muted">—</span>';
+  if (d.ready) return '<span class="pill ok">ready</span>';
+  const r = d.readiness || [];
+  const fails = r.filter((x) => x.status === 'fail').length;
+  const pend = r.filter((x) => x.status === 'pending').length;
+  const ok = r.filter((x) => x.status === 'ok' || x.status === 'warn').length;
+  return `<span class="pill ${fails ? 'failed' : 'pending'}">${ok}/${r.length}${fails ? ` · ${fails} blocking` : pend ? ' · run check' : ''}</span>`;
+}
+
+function checkList(checks) {
+  return `<table class="wl-table checks">${checks.map((x) => `
+    <tr><td class="check-icon ${x.status}">${CHECK_ICONS[x.status] || '?'}</td>
+      <td><strong>${esc(x.label || x.name)}</strong><div class="muted" style="font-size:.78rem">${esc(x.detail || '')}</div></td></tr>`).join('')}</table>`;
+}
+
+function copyButtons(root) {
+  root.querySelectorAll('[data-copy]').forEach((b) => b.addEventListener('click', async () => {
+    const text = root.querySelector(`#${b.dataset.copy}`).value;
+    try { await navigator.clipboard.writeText(text); toast('Copied', 'ok'); }
+    catch { root.querySelector(`#${b.dataset.copy}`).select(); toast('Press Ctrl+C to copy', 'info'); }
+  }));
+}
+
+async function tabDevices(c, project) {
+  const { devices, package: pkg } = await api('GET', `/api/projects/${project.id}/devices`);
+  const warnings = JSON.parse(sessionStorage.getItem(`devwarn:${project.id}`) || '[]');
+  const toMigrate = devices.filter((d) => d.plan === 'migrate');
+  const count = (f) => devices.filter(f).length;
+
+  const rows = devices.map((d) => `
+    <tr class="clickable" data-device="${d.id}">
+      <td><strong>${esc(d.name)}</strong>${d.missingSince ? ' <span class="pill failed">gone from source</span>' : ''}
+        <div class="muted" style="font-size:.74rem">${esc([d.inventory?.manufacturer, d.model, d.serialNumber].filter(Boolean).join(' · '))}</div></td>
+      <td style="font-size:.8rem">${esc(d.os || '—')}<div class="muted" style="font-size:.72rem">${esc(d.osVersion || '')}</div></td>
+      <td style="font-size:.8rem">${esc(joinLabel(d))}</td>
+      <td style="font-size:.8rem">${d.user
+        ? `${esc(d.user.sourceUpn)}<div class="muted mono" style="font-size:.72rem">→ ${esc(d.user.destUpn)}</div>`
+        : d.ownerUpn ? `<span class="muted">${esc(d.ownerUpn)}</span><div style="font-size:.72rem;color:var(--yellow)">not in project</div>` : '<span class="muted">—</span>'}</td>
+      <td class="muted" style="font-size:.78rem">${esc(d.lastActivityAt ? d.lastActivityAt.slice(0, 10) : '—')}</td>
+      <td data-stop><select class="plan-select" data-plan="${d.id}">
+        ${Object.entries(PLAN_LABELS).map(([k, v]) => `<option value="${k}" ${k === d.plan ? 'selected' : ''}>${v}</option>`).join('')}
+      </select></td>
+      <td>${readinessCell(d)}</td>
+      <td>${pill(d.status)}${d.step ? `<div class="muted" style="font-size:.72rem">${esc(d.step.replace(/_/g, ' '))}</div>` : ''}</td>
+    </tr>`).join('');
+
+  c.innerHTML = `
+    <div class="card">
+      <h3>Device migration</h3>
+      <p class="sub">Move Windows devices joined to Entra ID into the destination tenant without wiping them. The dolop agent hands each user's existing Windows profile to their new account, leaves the source tenant and joins the destination with your provisioning package. Everything else (registered devices, Macs, phones) is listed so nothing is forgotten.</p>
+      <div class="statrow">
+        <div class="stat"><div class="n">${devices.length}</div><div class="l">devices</div></div>
+        <div class="stat"><div class="n">${toMigrate.length}</div><div class="l">to migrate</div></div>
+        <div class="stat"><div class="n" style="color:var(--green)">${count((d) => d.ready)}</div><div class="l">ready</div></div>
+        <div class="stat"><div class="n">${count((d) => ['scheduled', 'migrating', 'joined'].includes(d.status))}</div><div class="l">in progress</div></div>
+        <div class="stat"><div class="n" style="color:var(--green)">${count((d) => d.status === 'completed')}</div><div class="l">done</div></div>
+        <div class="stat"><div class="n" style="color:${count((d) => d.status === 'failed') ? 'var(--red)' : 'inherit'}">${count((d) => d.status === 'failed')}</div><div class="l">failed</div></div>
+      </div>
+      <div class="btnrow" style="margin-top:.8rem">
+        <button class="primary" id="dv-sync">Sync from source tenant</button>
+        <button id="dv-bitlocker" ${devices.length ? '' : 'disabled'}>Back up all BitLocker keys</button>
+      </div>
+      ${warnings.length ? `<div class="warn-box">${warnings.map((w) => `<div>${esc(w)}</div>`).join('')}</div>` : ''}
+    </div>
+
+    <div class="card">
+      <h3>Destination provisioning package</h3>
+      ${pkg
+        ? `<p class="sub">${pill('ok')} <span class="mono">${esc(pkg.filename)}</span> · ${fmtBytes(pkg.size)} · uploaded ${fmtDate(pkg.uploadedAt)}. It contains an enrollment token for the destination tenant: dolop only hands it to devices with a valid agent token.</p>`
+        : '<p class="sub">Not uploaded yet. Devices join the destination tenant with this package.</p>'}
+      <details ${pkg ? '' : 'open'}><summary class="muted" style="cursor:pointer;font-size:.85rem">How to create it</summary>
+        <ol class="steps" style="font-size:.85rem">
+          <li>Install <strong>Windows Configuration Designer</strong> (Microsoft Store) on any Windows PC.</li>
+          <li>Choose <strong>Provision desktop devices</strong>. Untick <em>Set up device</em> (keep the device names), skip <em>Network</em>.</li>
+          <li>Under <strong>Account Management</strong> choose <strong>Enroll in Azure AD</strong>, set the bulk token expiry (up to 180 days) and click <strong>Get Bulk Token</strong>: sign in as an admin of the <strong>destination</strong> tenant.</li>
+          <li>Skip the remaining pages, <strong>Create</strong> the package, and upload the <code>.ppkg</code> file here.</li>
+        </ol>
+        <div class="muted" style="font-size:.8rem">In the destination tenant, users must be allowed to join devices to Entra ID, and Intune automatic enrollment (MDM user scope) should include the migrated users.</div>
+      </details>
+      <div class="btnrow" style="margin-top:.7rem">
+        <input type="file" id="dv-pkg-file" accept=".ppkg" style="max-width:320px" />
+        <button id="dv-pkg-upload">${pkg ? 'Replace package' : 'Upload package'}</button>
+        ${pkg ? '<button class="danger" id="dv-pkg-delete">Delete</button>' : ''}
+      </div>
+    </div>
+
+    <div class="card">
+      ${devices.length
+        ? `<table><thead><tr><th>Device</th><th>OS</th><th>Join</th><th>User</th><th>Last active</th><th>Plan</th><th>Readiness</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table>`
+        : '<div class="empty">No devices yet. Add users on the Users tab first (so devices can be paired with them), then click “Sync from source tenant”.</div>'}
+    </div>`;
+
+  c.querySelector('#dv-sync').addEventListener('click', async (e) => {
+    e.target.disabled = true; e.target.textContent = 'Syncing…';
+    try {
+      const r = await api('POST', `/api/projects/${project.id}/devices/discover`);
+      sessionStorage.setItem(`devwarn:${project.id}`, JSON.stringify(r.warnings || []));
+      toast(`${r.found} device(s) found: ${r.added} new${r.missing ? `, ${r.missing} no longer in the source tenant` : ''}`, 'ok');
+    } catch (err) { toast(err.message, 'error'); }
+    viewProject(project.id, 'devices');
+  });
+  c.querySelector('#dv-bitlocker').addEventListener('click', async (e) => {
+    e.target.disabled = true;
+    try {
+      const { results } = await api('POST', `/api/projects/${project.id}/devices/bitlocker`, {});
+      const failed = results.filter((r) => r.error);
+      toast(`BitLocker keys read for ${results.length - failed.length} device(s)${failed.length ? `; ${failed.length} failed: ${failed[0].error}` : ''}`, failed.length ? 'error' : 'ok');
+    } catch (err) { toast(err.message, 'error'); }
+    viewProject(project.id, 'devices');
+  });
+  c.querySelector('#dv-pkg-upload').addEventListener('click', async () => {
+    const file = c.querySelector('#dv-pkg-file').files[0];
+    if (!file) return toast('Choose the .ppkg file first', 'error');
+    try {
+      await api('PUT', `/api/projects/${project.id}/devices/package?filename=${encodeURIComponent(file.name)}`,
+        await file.arrayBuffer(), { raw: true, contentType: 'application/octet-stream' });
+      toast('Provisioning package uploaded', 'ok');
+      viewProject(project.id, 'devices');
+    } catch (err) { toast(err.message, 'error'); }
+  });
+  const del = c.querySelector('#dv-pkg-delete');
+  if (del) del.addEventListener('click', async () => {
+    if (!confirm('Delete the provisioning package? Devices that have not downloaded it yet will not be able to join.')) return;
+    try { await api('DELETE', `/api/projects/${project.id}/devices/package`); viewProject(project.id, 'devices'); }
+    catch (err) { toast(err.message, 'error'); }
+  });
+  c.querySelectorAll('[data-plan]').forEach((s) => s.addEventListener('change', async () => {
+    try {
+      await api('PATCH', `/api/projects/${project.id}/devices/${s.dataset.plan}`, { plan: s.value });
+      viewProject(project.id, 'devices');
+    } catch (err) { toast(err.message, 'error'); }
+  }));
+  c.querySelectorAll('tr[data-device]').forEach((tr) => tr.addEventListener('click', (e) => {
+    if (e.target.closest('[data-stop]')) return;
+    deviceModal(project, tr.dataset.device);
+  }));
+}
+
+async function deviceModal(project, deviceId) {
+  const [{ device: d, events }, { users }] = await Promise.all([
+    api('GET', `/api/projects/${project.id}/devices/${deviceId}`),
+    api('GET', `/api/projects/${project.id}/users?limit=500`),
+  ]);
+  const rep = d.agentReport || {};
+  const busy = ['scheduled', 'migrating'].includes(d.status);
+  const facts = [
+    ['Status', `${pill(d.status)} ${d.step ? `<span class="muted">${esc(d.step.replace(/_/g, ' '))}</span>` : ''}`],
+    d.detail ? ['Detail', esc(d.detail)] : null,
+    ['OS', esc(`${d.os || '—'} ${d.osVersion || ''}`)],
+    ['Join', esc(joinLabel(d))],
+    ['Serial', `<span class="mono">${esc(d.serialNumber || '—')}</span>`],
+    ['Primary user', esc(d.ownerUpn || '—')],
+    ['Last active', esc(d.lastActivityAt ? fmtDate(d.lastActivityAt) : '—')],
+    ['Intune', d.inventory?.inIntune ? esc(`${d.inventory.complianceState || ''} ${d.inventory.ownerType ? `· ${d.inventory.ownerType}` : ''}`) : 'not enrolled'],
+    ['Autopilot', d.autopilotId ? '<span style="color:var(--yellow)">registered</span>' : 'not registered'],
+    ['BitLocker keys', d.bitlockerCount ? `${d.bitlockerCount} saved in dolop` : 'none saved'],
+    d.agentLastSeenAt ? ['Agent last seen', esc(fmtDate(d.agentLastSeenAt))] : null,
+    d.agentTokenExpiresAt ? ['Agent command valid until', esc(fmtDate(d.agentTokenExpiresAt))] : null,
+    rep.scheduledFor ? ['Scheduled for', esc(fmtDate(rep.scheduledFor))] : null,
+    rep.profilePath ? ['Profile', `<span class="mono">${esc(rep.profilePath)}</span>`] : null,
+    rep.backupPath ? ['Backup on device', `<span class="mono">${esc(rep.backupPath)}</span>`] : null,
+  ].filter(Boolean);
+
+  const m = modal(`
+    <h2>${esc(d.name)}</h2>
+    <dl class="kv">${facts.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>
+    <div class="formgrid" style="margin-top:.4rem">
+      <div><label>Plan</label><select id="dm-plan">${Object.entries(PLAN_LABELS).map(([k, v]) => `<option value="${k}" ${k === d.plan ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
+      <div><label>Migration user</label><select id="dm-user"><option value="">— none —</option>
+        ${users.map((u) => `<option value="${u.id}" ${u.id === d.userId ? 'selected' : ''}>${esc(u.sourceUpn)} → ${esc(u.destUpn)}</option>`).join('')}</select></div>
+    </div>
+    ${d.plan === 'migrate' ? `<h2>Readiness</h2>${checkList(d.readiness)}` : ''}
+    ${rep.checks?.length ? `<h2>Last agent check</h2>${checkList(rep.checks)}` : ''}
+    <div class="btnrow" style="margin-top:1rem">
+      ${d.plan === 'migrate' && d.status !== 'cleaned_up' ? `<button class="primary" id="dm-agent">${d.agentTokenExpiresAt ? 'New agent command' : 'Create agent command'}</button>` : ''}
+      ${d.agentTokenExpiresAt ? '<button id="dm-revoke">Revoke agent command</button>' : ''}
+      ${d.entraDeviceId ? '<button id="dm-bl-backup">Back up BitLocker keys</button>' : ''}
+      ${d.bitlockerCount ? '<button id="dm-bl-view">Show recovery keys</button>' : ''}
+      ${d.autopilotId ? '<button id="dm-autopilot">Remove from Autopilot</button>' : ''}
+      ${d.plan === 'manual' && d.status !== 'completed' ? '<button id="dm-done">Mark done</button>' : ''}
+      ${(d.status === 'completed' || d.plan === 'cleanup') && d.status !== 'cleaned_up' ? '<button class="danger" id="dm-cleanup">Delete from source tenant</button>' : ''}
+      ${['failed', 'check_failed', 'completed', 'cleaned_up'].includes(d.status) ? '<button id="dm-reset">Reset status</button>' : ''}
+    </div>
+    <div id="dm-extra"></div>
+    ${events.length ? `<h2>Activity</h2><table class="wl-table">${events.slice(0, 30).map((e) => `
+      <tr><td class="muted" style="font-size:.74rem;white-space:nowrap">${esc(fmtDate(e.createdAt))}</td>
+      <td style="font-size:.8rem;${e.level === 'error' ? 'color:var(--red)' : e.level === 'warn' ? 'color:var(--yellow)' : ''}">${esc(e.message)}</td></tr>`).join('')}</table>` : ''}
+    <div class="actions"><button id="dm-close">Close</button></div>`, { wide: true });
+
+  const base = `/api/projects/${project.id}/devices/${d.id}`;
+  const reopen = () => { closeModal(); deviceModal(project, d.id); viewProject(project.id, 'devices'); };
+  const on = (id, fn) => { const el = m.querySelector(id); if (el) el.addEventListener('click', async () => { try { await fn(el); } catch (e) { toast(e.message, 'error'); } }); };
+
+  m.querySelector('#dm-plan').addEventListener('change', async (e) => {
+    try { await api('PATCH', base, { plan: e.target.value }); reopen(); } catch (err) { toast(err.message, 'error'); }
+  });
+  m.querySelector('#dm-user').addEventListener('change', async (e) => {
+    try { await api('PATCH', base, { userId: e.target.value || null }); reopen(); } catch (err) { toast(err.message, 'error'); }
+  });
+  on('#dm-close', async () => closeModal());
+  on('#dm-agent', async () => {
+    if (busy && !confirm('This device is already scheduled or migrating. Create a new command anyway? (The old one stops working.)')) return;
+    const r = await api('POST', `${base}/agent`, {});
+    const extra = m.querySelector('#dm-extra');
+    extra.innerHTML = `
+      <div class="warn-box">Copy these now: the token is shown only once. Valid until ${esc(fmtDate(r.expiresAt))}.</div>
+      <ol class="steps" style="font-size:.86rem">
+        <li>On <strong>${esc(d.name)}</strong>, open <strong>Windows PowerShell as administrator</strong> (or a remote session) and run the <strong>check</strong>. It changes nothing; results appear here.</li>
+        <li>Make sure a local admin account works, and tell the user to save their work.</li>
+        <li>Run <strong>migrate now</strong> (starts in two minutes) or <strong>schedule</strong> (edit the date and time). The user must be signed out by then; add <code>-ForceLogoff</code> to sign them out automatically. The device restarts by itself, and the user then signs in with their new account.</li>
+      </ol>
+      ${[['check', 'Check (no changes)'], ['migrateNow', 'Migrate now'], ['schedule', 'Schedule']].map(([k, label]) => `
+        <label>${label}</label>
+        <div class="linkbox"><input id="cmd-${k}" class="mono" readonly value="${esc(r.commands[k])}" /><button class="small" data-copy="cmd-${k}">Copy</button></div>`).join('')}`;
+    copyButtons(extra);
+  });
+  on('#dm-revoke', async () => {
+    if (!confirm('Revoke the agent command? A migration that is scheduled on the device will fail to start.')) return;
+    await api('DELETE', `${base}/agent`); reopen();
+  });
+  on('#dm-bl-backup', async () => {
+    const r = await api('POST', `${base}/bitlocker`);
+    toast(`${r.read} key(s) read from the source tenant`, 'ok'); reopen();
+  });
+  on('#dm-bl-view', async () => {
+    const { keys } = await api('GET', `${base}/bitlocker`);
+    m.querySelector('#dm-extra').innerHTML = `<h2>Recovery keys</h2><table class="wl-table">${keys.map((k) => `
+      <tr><td class="mono" style="font-size:.74rem">${esc(k.id)}</td><td class="mono">${esc(k.key)}</td>
+      <td class="muted" style="font-size:.74rem">${esc(k.source === 'agent' ? 'from device' : 'from Entra ID')}</td></tr>`).join('')}</table>
+      <div class="muted" style="font-size:.78rem">Viewing keys is recorded in the activity log.</div>`;
+  });
+  on('#dm-autopilot', async () => {
+    if (!confirm(`Remove ${d.name} from the source tenant's Autopilot?`)) return;
+    await api('POST', `${base}/autopilot/remove`); toast('Removed from Autopilot', 'ok'); reopen();
+  });
+  on('#dm-done', async () => { await api('PATCH', base, { status: 'completed' }); reopen(); });
+  on('#dm-reset', async () => { await api('PATCH', base, { status: 'discovered' }); reopen(); });
+  on('#dm-cleanup', async () => {
+    if (!confirm(`Delete ${d.name}'s Intune record and Entra ID device object from the SOURCE tenant? This cannot be undone. Back up its BitLocker keys first.`)) return;
+    const r = await api('POST', `${base}/cleanup`, {});
+    toast(r.deleted.length ? `Deleted ${r.deleted.join(' and ')}` : 'Nothing to delete', 'ok'); reopen();
   });
 }
 

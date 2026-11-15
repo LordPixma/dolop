@@ -60,6 +60,42 @@ describe('token cache', () => {
   });
 });
 
+const jwt = (payload: object) =>
+  `h.${btoa(JSON.stringify(payload)).replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_')}.s`;
+
+/** Replace the token endpoint (FakeGraph uses the first matching route). */
+function useTokenRoute(handler: () => Response): void {
+  fake = new FakeGraph();
+  vi.stubGlobal('fetch', fake.fetch);
+  fake
+    .route('POST', /^login\.microsoftonline\.com\/t1\/oauth2\/v2\.0\/token$/, handler)
+    .route('GET', /^\/organization$/, () => json({ value: [] }));
+}
+
+describe('tokens without application permissions', () => {
+  it('does not cache a role-less token minted while consent is propagating', async () => {
+    let roles: string[] = [];
+    useTokenRoute(() =>
+      json({ access_token: jwt({ roles }), expires_in: 3600 })
+    );
+    await client().get('/organization');
+    expect(kv.data.size).toBe(0);
+    roles = ['Organization.Read.All'];
+    await client().get('/organization');
+    expect(tokenRequests()).toBe(2);
+    expect(kv.data.size).toBe(1);
+  });
+
+  it('refreshToken ignores the cache and reports the roles', async () => {
+    useTokenRoute(() =>
+      json({ access_token: jwt({ roles: ['User.Read.All'] }), expires_in: 3600 })
+    );
+    await client().get('/organization');
+    expect(await client().refreshToken()).toEqual(['User.Read.All']);
+    expect(tokenRequests()).toBe(2);
+  });
+});
+
 describe('retries', () => {
   it('retries an idempotent request once on a 5xx', async () => {
     let calls = 0;

@@ -139,6 +139,27 @@ connectorsApi.delete('/:id', async (c) => {
   return c.json({ ok: true });
 });
 
+const VERIFY_ROLES = ['Organization.Read.All', 'User.Read.All'];
+
+/** Explain a 403 from Verify using the roles actually present in the token. */
+function permissionHint(roles: string[] | null): string {
+  if (roles === null) return '';
+  if (roles.length === 0) {
+    return (
+      ' — the token carries no application permissions. Either admin consent is still propagating ' +
+      '(wait a few minutes and Verify again) or it was never granted: a Global Administrator or ' +
+      'Privileged Role Administrator of this tenant must approve the consent link (or click ' +
+      '"Grant admin consent" on the app\'s API permissions page).'
+    );
+  }
+  const missing = VERIFY_ROLES.filter(
+    (r) => !roles.includes(r) && !(r === 'User.Read.All' && roles.includes('User.ReadWrite.All'))
+  );
+  return missing.length > 0
+    ? ` — missing application permission(s): ${missing.join(', ')}. Add them and grant admin consent again.`
+    : '';
+}
+
 // Verifies credentials and core Graph permissions; records the result.
 connectorsApi.post('/:id/verify', async (c) => {
   const connector = await loadConnector(c.env, c.var.workspaceId, c.req.param('id'));
@@ -149,7 +170,9 @@ connectorsApi.post('/:id/verify', async (c) => {
     );
   }
   const client = new GraphClient(await credsForConnector(c.env, connector), c.env.KV);
+  let roles: string[] | null = null;
   try {
+    roles = await client.refreshToken();
     const org = await client.get<{ value: Organization[] }>(
       '/organization?$select=displayName,verifiedDomains'
     );
@@ -163,7 +186,7 @@ connectorsApi.post('/:id/verify', async (c) => {
     await updateConnectorVerify(c.env.DB, connector.id, 'ok', detail);
     return c.json({ ok: true, detail });
   } catch (e) {
-    const message =
+    let message =
       e instanceof GraphAuthError
         ? e.message
         : e instanceof GraphError
@@ -171,6 +194,7 @@ connectorsApi.post('/:id/verify', async (c) => {
           : e instanceof Error
             ? e.message
             : String(e);
+    if (e instanceof GraphError && e.status === 403) message += permissionHint(roles);
     await updateConnectorVerify(c.env.DB, connector.id, 'failed', message);
     return c.json({ ok: false, error: message }, 422);
   }

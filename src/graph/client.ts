@@ -2,6 +2,8 @@
 // throttling awareness (429/503 → GraphThrottleError with retry-after), and
 // helpers for paged collections and raw content streams.
 
+import { decodeJwtPayload } from '../crypto';
+
 const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
 
 export interface GraphCredentials {
@@ -41,6 +43,15 @@ export class GraphAuthError extends Error {
 interface TokenCacheEntry {
   token: string;
   expiresAt: number;
+  /** Application permissions in the token's `roles` claim; null if the token is not a readable JWT. */
+  roles?: string[] | null;
+}
+
+/** The `roles` claim of an app-only token, or null when the token cannot be decoded. */
+function tokenRoles(token: string): string[] | null {
+  const payload = decodeJwtPayload(token);
+  if (!payload) return null;
+  return Array.isArray(payload.roles) ? payload.roles.filter((r): r is string => typeof r === 'string') : [];
 }
 
 /** Default per-request timeout; byte-range transfers get TRANSFER_TIMEOUT_MS. */
@@ -111,9 +122,16 @@ async function fetchToken(creds: GraphCredentials, kv: KVNamespace, timeoutMs: n
   const entry: TokenCacheEntry = {
     token: body.access_token,
     expiresAt: Date.now() + (body.expires_in ?? 3600) * 1000,
+    roles: tokenRoles(body.access_token),
   };
-  const ttl = Math.max(60, (body.expires_in ?? 3600) - 300);
-  await kv.put(cacheKey, JSON.stringify(entry), { expirationTtl: ttl });
+  // A token with no application permissions is what Entra issues while a fresh
+  // admin consent is still propagating. Caching it would make every request in
+  // the next hour fail with Authorization_RequestDenied, so only cache tokens
+  // that carry roles (or that we cannot decode).
+  if (!entry.roles || entry.roles.length > 0) {
+    const ttl = Math.max(60, (body.expires_in ?? 3600) - 300);
+    await kv.put(cacheKey, JSON.stringify(entry), { expirationTtl: ttl });
+  }
   return entry;
 }
 
@@ -161,6 +179,18 @@ export class GraphClient {
   private async dropToken(): Promise<void> {
     this.token = null;
     await this.kv.delete(await tokenCacheKey(this.creds));
+  }
+
+  /**
+   * Discard any cached token and mint a fresh one. Returns the application
+   * permissions it carries (null if the token is not a readable JWT). Used by
+   * connector verification so a token minted before consent finished
+   * propagating is never re-used.
+   */
+  async refreshToken(): Promise<string[] | null> {
+    await this.dropToken();
+    this.token = await fetchToken(this.creds, this.kv, this.timeoutMs);
+    return this.token.roles ?? tokenRoles(this.token.token);
   }
 
   get tenantId(): string {

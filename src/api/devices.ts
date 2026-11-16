@@ -354,7 +354,7 @@ devicesApi.post('/:projectId/devices/:deviceId/agent', async (c) => {
   const tokenBytes = crypto.getRandomValues(new Uint8Array(32));
   const token = btoa(String.fromCharCode(...tokenBytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   const expiresAt = new Date(Date.now() + days * 86_400_000).toISOString();
-  const keepStatus = ['scheduled', 'migrating', 'joined', 'completed'].includes(device.status);
+  const keepStatus = ['scheduled', 'migrating', 'awaiting_join', 'joined', 'completed'].includes(device.status);
   await updateDevice(c.env.DB, device.id, {
     sourceSid: source.sid,
     destSid: dest.sid,
@@ -382,6 +382,7 @@ devicesApi.post('/:projectId/devices/:deviceId/agent', async (c) => {
       migrateNow: `${prefix} -Mode Schedule`,
       schedule: `${prefix} -Mode Schedule -At '2026-01-31 18:00'`,
     },
+    joinMode: (await packageInfo(c.env, project.id)) ? 'package' : 'manual',
   });
 });
 

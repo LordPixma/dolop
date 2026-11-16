@@ -73,6 +73,9 @@ agentApi.get('/plan', async (c) => {
     sourceUser: { upn: user.sourceUpn, sid: device.sourceSid },
     destUser: { upn: user.destUpn, sid: device.destSid },
     package: pkg ? { available: true, sha256: pkg.sha256, size: pkg.size } : { available: false },
+    // Without a package the agent stops after leaving the source tenant and
+    // someone joins the destination by hand (Settings > Access work or school).
+    joinMode: pkg ? 'package' : 'manual',
   });
 });
 
@@ -104,7 +107,7 @@ export function statusForReport(current: DeviceStatus, r: ReportBody): DeviceSta
   if (current === 'completed' || current === 'cleaned_up') return null;
   if (r.phase === 'check' && r.status === 'done') {
     // A pre-flight re-run never drags a device that is already moving backwards.
-    if (['scheduled', 'migrating', 'joined'].includes(current)) return null;
+    if (['scheduled', 'migrating', 'awaiting_join', 'joined'].includes(current)) return null;
     return r.checks?.some((x) => x.status === 'fail') ? 'check_failed' : 'checked';
   }
   if (r.status === 'fail' && r.phase !== 'check') return 'failed';
@@ -114,7 +117,8 @@ export function statusForReport(current: DeviceStatus, r: ReportBody): DeviceSta
   }
   if (r.phase === 'migrate') {
     if (r.step === 'joined' && r.status === 'ok') return 'joined';
-    return current === 'joined' ? null : 'migrating';
+    if (r.step === 'awaiting_join' && r.status === 'ok') return 'awaiting_join';
+    return current === 'joined' || current === 'awaiting_join' ? null : 'migrating';
   }
   if (r.phase === 'postjoin') return r.status === 'done' ? 'completed' : 'joined';
   return null;

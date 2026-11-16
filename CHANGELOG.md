@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Device migration without a provisioning package.** The package is now optional. Without
+  one (or with the agent's `-ManualJoin` switch), the agent hands the profile over and leaves
+  the source tenant, then someone joins the device in Settings with a normal interactive
+  sign-in, which avoids bulk-token problems with MFA and Conditional Access. The device shows
+  *awaiting join* and the agent finishes by itself once the join appears. `docs/devices.md`
+  also covers why *Get Bulk Token* fails.
+
 - **Device migration.** A new Devices tab inventories the source tenant's devices (Entra ID,
   Intune, Autopilot, Windows LAPS), pairs them with migration users, suggests a plan for each
   and checks readiness. It backs up BitLocker recovery keys (encrypted), removes devices from

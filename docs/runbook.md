@@ -33,7 +33,7 @@ A practical sequence for moving an acquired organisation from tenant A (source) 
    tenant's outbound spam policy — see [coexistence.md](coexistence.md).
 
 10. **Devices** (optional): on the Devices tab, *Sync from source tenant*, back up BitLocker keys,
-    remove devices from Autopilot, upload the destination provisioning package and run the
+    remove devices from Autopilot, optionally upload the destination provisioning package and run the
     agent's **Check** on each Windows device you'll move — see [devices.md](devices.md).
 
 ## Cutover weekend

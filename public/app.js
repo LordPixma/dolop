@@ -1452,7 +1452,7 @@ async function tabDevices(c, project) {
         <div class="stat"><div class="n">${devices.length}</div><div class="l">devices</div></div>
         <div class="stat"><div class="n">${toMigrate.length}</div><div class="l">to migrate</div></div>
         <div class="stat"><div class="n" style="color:var(--green)">${count((d) => d.ready)}</div><div class="l">ready</div></div>
-        <div class="stat"><div class="n">${count((d) => ['scheduled', 'migrating', 'joined'].includes(d.status))}</div><div class="l">in progress</div></div>
+        <div class="stat"><div class="n">${count((d) => ['scheduled', 'migrating', 'awaiting_join', 'joined'].includes(d.status))}</div><div class="l">in progress</div></div>
         <div class="stat"><div class="n" style="color:var(--green)">${count((d) => d.status === 'completed')}</div><div class="l">done</div></div>
         <div class="stat"><div class="n" style="color:${count((d) => d.status === 'failed') ? 'var(--red)' : 'inherit'}">${count((d) => d.status === 'failed')}</div><div class="l">failed</div></div>
       </div>
@@ -1464,11 +1464,11 @@ async function tabDevices(c, project) {
     </div>
 
     <div class="card">
-      <h3>Destination provisioning package</h3>
+      <h3>Destination provisioning package <span class="muted" style="font-weight:400;font-size:.85rem">(optional)</span></h3>
       ${pkg
-        ? `<p class="sub">${pill('ok')} <span class="mono">${esc(pkg.filename)}</span> · ${fmtBytes(pkg.size)} · uploaded ${fmtDate(pkg.uploadedAt)}. It contains an enrollment token for the destination tenant: dolop only hands it to devices with a valid agent token.</p>`
-        : '<p class="sub">Not uploaded yet. Devices join the destination tenant with this package.</p>'}
-      <details ${pkg ? '' : 'open'}><summary class="muted" style="cursor:pointer;font-size:.85rem">How to create it</summary>
+        ? `<p class="sub">${pill('ok')} <span class="mono">${esc(pkg.filename)}</span> · ${fmtBytes(pkg.size)} · uploaded ${fmtDate(pkg.uploadedAt)}. Devices join the destination tenant automatically. It contains an enrollment token for the destination tenant: dolop only hands it to devices with a valid agent token.</p>`
+        : '<p class="sub">Not uploaded, so devices are joined <strong>by hand</strong>: once the agent has left the source tenant and restarted the device, sign in with the local admin account and join it in <em>Settings → Accounts → Access work or school → Connect → Join this device to Microsoft Entra ID</em>. dolop finishes automatically within 10 minutes. Upload a package to make the join automatic.</p>'}
+      <details><summary class="muted" style="cursor:pointer;font-size:.85rem">How to create it</summary>
         <ol class="steps" style="font-size:.85rem">
           <li>Install <strong>Windows Configuration Designer</strong> (Microsoft Store) on any Windows PC.</li>
           <li>Choose <strong>Provision desktop devices</strong>. Untick <em>Set up device</em> (keep the device names), skip <em>Network</em>.</li>
@@ -1581,6 +1581,13 @@ async function deviceModal(project, deviceId) {
       ${(d.status === 'completed' || d.plan === 'cleanup') && d.status !== 'cleaned_up' ? '<button class="danger" id="dm-cleanup">Delete from source tenant</button>' : ''}
       ${['failed', 'check_failed', 'completed', 'cleaned_up'].includes(d.status) ? '<button id="dm-reset">Reset status</button>' : ''}
     </div>
+    ${d.status === 'awaiting_join' ? `<div class="warn-box"><strong>Waiting for someone to join this device to the destination tenant.</strong>
+      <ol class="steps" style="margin-bottom:0">
+        <li>On ${esc(d.name)}, sign in with the <strong>local administrator</strong> account.</li>
+        <li>Open <strong>Settings → Accounts → Access work or school → Connect</strong>, choose <strong>Join this device to Microsoft Entra ID</strong> and sign in as <span class="mono">${esc(d.user ? d.user.destUpn : 'the user')}</span> (or a destination admin).</li>
+        <li>Sign out. The user signs in with their new account and gets their own desktop.</li>
+      </ol>
+      <div class="muted" style="font-size:.8rem;margin-top:.4rem">The agent checks every 10 minutes and finishes by itself (BitLocker backup to the new tenant, local groups). It gives up after 3 days.</div></div>` : ''}
     <div id="dm-extra"></div>
     ${events.length ? `<h2>Activity</h2><table class="wl-table">${events.slice(0, 30).map((e) => `
       <tr><td class="muted" style="font-size:.74rem;white-space:nowrap">${esc(fmtDate(e.createdAt))}</td>
@@ -1607,7 +1614,9 @@ async function deviceModal(project, deviceId) {
       <ol class="steps" style="font-size:.86rem">
         <li>On <strong>${esc(d.name)}</strong>, open <strong>Windows PowerShell as administrator</strong> (or a remote session) and run the <strong>check</strong>. It changes nothing; results appear here.</li>
         <li>Make sure a local admin account works, and tell the user to save their work.</li>
-        <li>Run <strong>migrate now</strong> (starts in two minutes) or <strong>schedule</strong> (edit the date and time). The user must be signed out by then; add <code>-ForceLogoff</code> to sign them out automatically. The device restarts by itself, and the user then signs in with their new account.</li>
+        <li>Run <strong>migrate now</strong> (starts in two minutes) or <strong>schedule</strong> (edit the date and time). The user must be signed out by then; add <code>-ForceLogoff</code> to sign them out automatically. ${r.joinMode === 'manual'
+          ? 'There is no provisioning package, so after the device restarts <strong>someone joins it by hand</strong>: sign in with the local admin account and join the destination tenant in Settings (the steps appear on this page).'
+          : 'The device joins the destination tenant and restarts by itself; the user then signs in with their new account.'}</li>
       </ol>
       ${[['check', 'Check (no changes)'], ['migrateNow', 'Migrate now'], ['schedule', 'Schedule']].map(([k, label]) => `
         <label>${label}</label>

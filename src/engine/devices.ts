@@ -391,9 +391,11 @@ export function deviceReadiness(
       ? 'A Windows LAPS password is backed up in the source tenant: retrieve it before cutover.'
       : 'No LAPS password found: make sure a local admin account works (the agent checks too).');
 
-  add('package', 'Destination provisioning package uploaded',
-    ctx.packageAvailable ? 'ok' : 'fail',
-    ctx.packageAvailable ? 'Ready' : 'Upload the .ppkg made in Windows Configuration Designer.');
+  add('package', 'How the device joins the destination',
+    ctx.packageAvailable ? 'ok' : 'warn',
+    ctx.packageAvailable
+      ? 'Automatically, with the uploaded provisioning package'
+      : 'No provisioning package: after the agent restarts the device, sign in with the local admin account and join it in Settings.');
 
   const agentChecks = device.agentReport?.checks;
   if (!agentChecks?.length) {

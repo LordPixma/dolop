@@ -124,7 +124,7 @@ migrations, ensures queues exist, and syncs optional `DOLOP_*` secrets).
 | --- | --- |
 | [Setup guide](docs/setup.md) | Entra app registrations (consent-link & manual modes), permissions, Cloudflare provisioning |
 | [M&A runbook](docs/runbook.md) | Step-by-step cutover playbook, from assessment to aftercare |
-| [Device migration](docs/devices.md) | Moving Windows devices to the new tenant without a wipe: permissions, the provisioning package, what the agent does, recovery |
+| [Device migration](docs/devices.md) | Moving Windows devices to the new tenant without a wipe: permissions, joining by package or by hand, what the agent does, recovery |
 | [Coexistence](docs/coexistence.md) | Mail dual-delivery during the overlap window: how forwarding works, direction at cutover, the external-forwarding caveat |
 | [Architecture](docs/architecture.md) | Engine internals, tick budgets, idempotency model, security |
 | [FAQ](docs/faq.md) | Costs, speed, data handling, comparisons, troubleshooting |

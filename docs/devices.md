@@ -8,9 +8,11 @@ phones, stale records) is inventoried on the same page so nothing is forgotten.
 There are two halves:
 
 - **Server side (dolop):** inventory, readiness checks, BitLocker key backup, Autopilot
-  removal, the destination provisioning package, and cleanup of source records afterwards.
+  removal, the optional destination provisioning package, and cleanup of source records
+  afterwards.
 - **On the device (the dolop agent):** a PowerShell script that hands the user's existing
-  profile to their new account, leaves the source tenant and joins the destination tenant.
+  profile to their new account, leaves the source tenant and joins the destination tenant,
+  either automatically with a provisioning package or with a person joining it in Settings.
   A cloud service can't do this part: it has to run on the device.
 
 > **Test on a spare device or VM first.** The agent edits the Windows profile registry and
@@ -58,11 +60,38 @@ The destination connector needs nothing new (it already has `User.Read.All`).
   devices in the destination's Intune.
 - The users exist and are licensed. Provision them on the Users tab first.
 
-### The provisioning package
+### Joining the destination tenant: package or by hand
 
-Devices join the destination tenant with a **provisioning package** containing a bulk
-enrollment token. Microsoft only issues that token through an interactive admin sign-in, so you
-create the package once and upload it to dolop:
+There are two ways for a device to join the destination tenant. dolop picks one automatically:
+
+| | Provisioning package (automatic) | Manual join (no package) |
+| --- | --- | --- |
+| When | A `.ppkg` is uploaded on the Devices tab | No package uploaded, or the agent was run with `-ManualJoin` |
+| At cutover | Unattended: the device joins and restarts by itself | Someone signs in with the local admin account and joins the device in Settings |
+| MFA / Conditional Access | The package's service account can't do MFA: see the bulk-token notes below | A normal interactive sign-in, so MFA and Conditional Access work as usual |
+| Best for | Many devices | A handful of devices, or when the bulk token can't be created |
+
+**Manual join, step by step** (the device's page in dolop shows the same steps while it waits):
+
+1. The agent hands the profile over, leaves the source tenant and restarts the device. The
+   device shows **awaiting join** in dolop.
+2. Sign in on the device with the **local administrator** account.
+3. Open **Settings → Accounts → Access work or school → Connect**, choose **Join this device to
+   Microsoft Entra ID**, and sign in as the user's new account (or a destination admin).
+4. Sign out. The user signs in with their new account and gets their own desktop.
+5. The agent checks every 10 minutes and finishes by itself within 10 minutes of the join
+   (BitLocker backup to the new tenant, local groups), then reports **completed**. If nobody
+   joins the device within 3 days it stops waiting and reports a failure.
+
+In manual mode a working local administrator account is required (the Check fails without one),
+because after the device leaves the source tenant nobody can sign in with a work account until
+it is joined again.
+
+### The provisioning package (optional)
+
+For an unattended join, devices use a **provisioning package** containing a bulk enrollment
+token. Microsoft only issues that token through an interactive admin sign-in, so you create the
+package once and upload it to dolop:
 
 1. Install **Windows Configuration Designer** from the Microsoft Store on any Windows PC.
 2. Choose **Provision desktop devices**. Untick *Set up device* (so device names are kept) and
@@ -70,6 +99,24 @@ create the package once and upload it to dolop:
 3. Under **Account Management** choose **Enroll in Azure AD**, set the bulk token expiry (up to
    180 days), click **Get Bulk Token** and sign in as an admin of the **destination** tenant.
 4. Skip the remaining pages, **Create** the package, and upload the `.ppkg` on the Devices tab.
+
+**If *Get Bulk Token* fails** in Windows Configuration Designer, the usual causes in the
+destination tenant are:
+
+- *Require Multifactor Authentication to register or join devices* is on (Entra ID → Devices →
+  Device settings), or a Conditional Access policy requires MFA for registering or joining
+  devices or for all cloud apps. The token belongs to a `package_<guid>` service account that
+  can't do MFA: turn the setting off for the migration window and exclude the package account
+  from those policies. Security defaults can also block it.
+- *Users may join devices to Microsoft Entra* is not set to **All** (the package account can't
+  be in a "Selected" list in advance), or the per-user device limit is too low.
+- The sign-in uses a guest account, an account from another tenant, or one without rights to
+  create users. Use a Global Administrator of the destination tenant.
+- An old Windows Configuration Designer: use the current Store version or the one in the latest
+  Windows ADK.
+
+The destination tenant's sign-in logs show the exact error code for the failed sign-in. If you
+can't get the token, skip the package and use the manual join.
 
 The package lets any device that runs it join the destination tenant, so treat it like a
 password. dolop stores it in R2 and only hands it to devices presenting a valid agent token. The
@@ -85,7 +132,7 @@ agent deletes it from the device when it finishes.
 4. Open each device to migrate and work through its **Readiness** list:
    - remove it from Autopilot (otherwise a future reset rejoins the old tenant);
    - make sure a local administrator account works (retrieve the LAPS password if you use it);
-   - upload the provisioning package.
+   - optionally upload the provisioning package, for an unattended join.
 5. **Create agent command.** dolop looks the user up in both tenants and works out both profile
    SIDs. You get three commands (the token in them is shown once):
    - **Check:** run it on the device in *Windows PowerShell (Run as administrator)*. It changes
@@ -96,8 +143,9 @@ agent deletes it from the device when it finishes.
 
    The user must be signed out when the migration starts. Add `-ForceLogoff` to sign them out
    automatically. Tell them to save their work first.
-6. Watch progress on the Devices tab. The device restarts by itself; the user then signs in with
-   their **new** account and gets their own desktop.
+6. Watch progress on the Devices tab. With a package, the device joins and restarts by itself;
+   without one, it restarts and shows **awaiting join** until someone joins it in Settings (see
+   above). The user then signs in with their **new** account and gets their own desktop.
 7. When a device shows **completed**, click **Delete from source tenant** to remove its old
    Intune record and Entra device object. Do the same for devices planned for *Clean up*.
 
@@ -130,14 +178,20 @@ to `%ProgramData%\Dolop` (readable by SYSTEM and Administrators only), and regis
 4. **Leave the source tenant:** unenrolls from Intune, then `dsregcmd /leave`. If the device
    doesn't leave, the profile is restored and the user can carry on with their old account.
 5. **Join the destination tenant** with the provisioning package, and waits up to 10 minutes
-   for the join to show.
+   for the join to show. In manual mode it skips this, reports **awaiting join** with the steps
+   for whoever joins the device, and schedules the finish task to check every 10 minutes for 3
+   days.
 6. Registers the *finish* task and restarts the device after one minute.
 
-**PostJoin** (first start-up after the restart): confirms the device is joined to the
-destination tenant, backs the BitLocker recovery keys up to the new tenant, adds the new account
-to the local groups the old one was in (for example Administrators), deletes the provisioning
-package and token from the device, and reports **completed**. It retries at the next two
-start-ups if the join hasn't shown up yet.
+**PostJoin** (first start-up after the restart, and every 10 minutes while waiting for a manual
+join): confirms the device is joined to the destination tenant, backs the BitLocker recovery keys
+up to the new tenant, adds the new account to the local groups the old one was in (for example
+Administrators), deletes the provisioning package and token from the device, and reports
+**completed**. With a package it retries at the next two start-ups if the join hasn't shown up
+yet.
+
+Add `-ManualJoin` to the Check or Schedule command to use a manual join even when a package is
+uploaded.
 
 ### The SIDs
 
@@ -156,6 +210,7 @@ SID and loads it.
 | Profile hand-over failed | Unchanged (backup restored) | Read the detail on the device's page; fix and retry |
 | Couldn't leave the source tenant | Still in the source tenant, profile restored | Retry, or disconnect it in *Settings → Accounts → Access work or school* |
 | Left the source tenant, but the join failed | Not joined to any tenant; profile already handed over | Sign in with the local admin, check the package (bulk token expiry), then either run *Migrate now* again (it resumes at the join) or join in *Settings → Accounts → Access work or school* with the user's new account |
+| Awaiting join for 3 days (manual join) | Not joined to any tenant; profile already handed over | Join it in *Settings → Accounts → Access work or school*, then *Mark done* in dolop (the finish step no longer runs: back the BitLocker key up to the new tenant by hand) |
 | Joined, but the finish step failed | In the destination tenant | Check the detail; back up BitLocker keys and local groups by hand if needed; *Mark done* |
 
 To undo the profile hand-over by hand (only meaningful while the device is still in the source

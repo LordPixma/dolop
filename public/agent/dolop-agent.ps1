@@ -15,9 +15,13 @@
       Migrate         Run by the scheduled task. Hands the user's profile to their
                       destination account, leaves the source tenant, joins the
                       destination tenant with the provisioning package, restarts.
-      PostJoin        Runs at the first start-up after Migrate. Confirms the join,
-                      backs BitLocker keys up to the new tenant, restores local
-                      group memberships and reports completion.
+                      Without a package (or with -ManualJoin) it stops after leaving
+                      the source tenant: join the device to the destination tenant
+                      by hand in Settings after the restart.
+      PostJoin        Runs after Migrate (at start-up, and every 10 minutes while
+                      waiting for a manual join). Confirms the join, backs BitLocker
+                      keys up to the new tenant, restores local group memberships
+                      and reports completion.
       RestoreProfile  Undoes the profile hand-over from the latest backup.
 
     Everything is logged to %ProgramData%\Dolop\agent.log and reported to dolop.
@@ -30,7 +34,8 @@ param(
     [string]$Mode = 'Check',
     [string]$At,
     [switch]$ForceLogoff,
-    [switch]$SkipLocalAdminCheck
+    [switch]$SkipLocalAdminCheck,
+    [switch]$ManualJoin
 )
 
 $ErrorActionPreference = 'Stop'
@@ -45,6 +50,7 @@ $TaskMigrate = 'Dolop Device Migration'
 $TaskPostJoin = 'Dolop Device Migration - Finish'
 $ProfileListPath = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
 $HiveMount = 'DolopProfileHive'
+$ManualJoinDays = 3
 $Server = $Server.TrimEnd('/')
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
 
@@ -266,6 +272,15 @@ function Get-Plan {
     return $plan
 }
 
+# 'package': join with the provisioning package. 'manual': someone joins the
+# device in Settings after the agent has left the source tenant.
+function Get-JoinMode($Plan) {
+    if ($ManualJoin) { return 'manual' }
+    if ($Plan.PSObject.Properties['joinMode'] -and $Plan.joinMode) { return [string]$Plan.joinMode }
+    if ($Plan.package.available) { return 'package' }
+    return 'manual'
+}
+
 # ---------------------------------------------------------------------------
 # Pre-flight
 
@@ -334,20 +349,26 @@ function Invoke-Checks($Plan, [bool]$Strict) {
         else { Add-Check 'signed_out' 'warn' 'User is signed in: they must be signed out at migration time (or use -ForceLogoff)' }
     } else { Add-Check 'signed_out' 'ok' 'User is signed out' }
 
+    $joinMode = Get-JoinMode $Plan
+    $ctx.JoinMode = $joinMode
     try {
         $admins = Get-EnabledLocalAdmins
         if ($admins.Count -gt 0) { Add-Check 'local_admin' 'ok' ("Enabled local admin account(s): " + ($admins -join ', ')) }
+        elseif ($joinMode -eq 'manual') { Add-Check 'local_admin' 'fail' 'No enabled local administrator account: one is needed to sign in and join the destination tenant by hand' }
         elseif ($SkipLocalAdminCheck) { Add-Check 'local_admin' 'warn' 'No enabled local admin account (check skipped)' }
         else { Add-Check 'local_admin' 'fail' 'No enabled local administrator account: create one (or enable LAPS) so the device stays recoverable' }
     } catch { Add-Check 'local_admin' 'warn' "Could not list local admins: $($_.Exception.Message)" }
 
-    if ($Plan.package.available) { Add-Check 'package' 'ok' 'Provisioning package available' }
-    else { Add-Check 'package' 'fail' 'No provisioning package uploaded in dolop' }
-
-    try {
-        if (Get-Command Install-ProvisioningPackage -ErrorAction SilentlyContinue) { Add-Check 'provisioning' 'ok' 'Install-ProvisioningPackage available' }
-        else { Add-Check 'provisioning' 'fail' 'Install-ProvisioningPackage is not available on this Windows build' }
-    } catch { Add-Check 'provisioning' 'fail' $_.Exception.Message }
+    if ($joinMode -eq 'manual') {
+        Add-Check 'join' 'warn' 'Manual join: after the restart, sign in with the local admin account and join the destination tenant in Settings'
+    } else {
+        if ($Plan.package.available) { Add-Check 'package' 'ok' 'Provisioning package available' }
+        else { Add-Check 'package' 'fail' 'No provisioning package uploaded in dolop (or use -ManualJoin)' }
+        try {
+            if (Get-Command Install-ProvisioningPackage -ErrorAction SilentlyContinue) { Add-Check 'provisioning' 'ok' 'Install-ProvisioningPackage available' }
+            else { Add-Check 'provisioning' 'fail' 'Install-ProvisioningPackage is not available on this Windows build (use -ManualJoin)' }
+        } catch { Add-Check 'provisioning' 'fail' $_.Exception.Message }
+    }
 
     $drive = Get-PSDrive -Name $env:SystemDrive.TrimEnd(':')
     $freeGb = [Math]::Round($drive.Free / 1GB, 1)
@@ -659,14 +680,17 @@ function Invoke-ScheduleMode {
     $scriptFile = Join-Path $Root 'dolop-agent.ps1'
     Invoke-WebRequest -Uri ($Server + '/api/agent/script') -OutFile $scriptFile -UseBasicParsing | Out-Null
     Set-Content -Path (Join-Path $Root 'token') -Value (Get-AgentToken) -NoNewline -Encoding ASCII
-    $pkg = Join-Path $Root 'package.ppkg'
-    Invoke-Dolop 'GET' '/api/agent/package' -OutFile $pkg
-    $hash = (Get-FileHash -Path $pkg -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($plan.package.sha256 -and $hash -ne $plan.package.sha256) { throw 'Provisioning package download is corrupt (hash mismatch)' }
+    if ($r.Context.JoinMode -eq 'package') {
+        $pkg = Join-Path $Root 'package.ppkg'
+        Invoke-Dolop 'GET' '/api/agent/package' -OutFile $pkg
+        $hash = (Get-FileHash -Path $pkg -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($plan.package.sha256 -and $hash -ne $plan.package.sha256) { throw 'Provisioning package download is corrupt (hash mismatch)' }
+    }
 
     $extra = '-Mode Migrate'
     if ($ForceLogoff) { $extra += ' -ForceLogoff' }
     if ($SkipLocalAdminCheck) { $extra += ' -SkipLocalAdminCheck' }
+    if ($ManualJoin) { $extra += ' -ManualJoin' }
     Register-AgentTask $TaskMigrate $extra (New-ScheduledTaskTrigger -Once -At $when)
     $whenText = $when.ToString('yyyy-MM-dd HH:mm')
     Send-Report -Phase 'schedule' -Step 'scheduled' -Status 'ok' -Detail "Migration scheduled for $whenText (device local time)" `
@@ -674,7 +698,12 @@ function Invoke-ScheduleMode {
     Write-Host ''
     Write-Host "Scheduled for $whenText. If the device is off then, it runs as soon as it starts." -ForegroundColor Green
     Write-Host "Make sure $($plan.sourceUser.upn) is signed out by then (or schedule with -ForceLogoff)." -ForegroundColor Green
-    Write-Host 'The device restarts by itself when the migration is done. Progress shows in dolop.' -ForegroundColor Green
+    if ($r.Context.JoinMode -eq 'manual') {
+        Write-Host 'Manual join: after the device restarts, sign in with the local admin account and join it to the' -ForegroundColor Yellow
+        Write-Host 'destination tenant in Settings > Accounts > Access work or school > Connect.' -ForegroundColor Yellow
+    } else {
+        Write-Host 'The device restarts by itself when the migration is done. Progress shows in dolop.' -ForegroundColor Green
+    }
 }
 
 function Invoke-UnscheduleMode {
@@ -766,6 +795,22 @@ function Invoke-MigrateMode {
 
     }
 
+    if (-not $ctx.DestJoined -and $ctx.JoinMode -eq 'manual') {
+        # --- Manual join: hand over to a person, then finish when the join shows up ---
+        Set-Content -Path (Join-Path $Root 'manual-join') -Value (Get-Date).ToString('o')
+        $atStartup = New-ScheduledTaskTrigger -AtStartup
+        $atStartup.Delay = 'PT1M'
+        $poll = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5) `
+            -RepetitionInterval (New-TimeSpan -Minutes 10) -RepetitionDuration (New-TimeSpan -Days $ManualJoinDays)
+        Register-AgentTask $TaskPostJoin '-Mode PostJoin -ManualJoin' @($atStartup, $poll)
+        Remove-AgentTask $TaskMigrate
+        Send-Report -Phase 'migrate' -Step 'awaiting_join' -Status 'ok' -Detail ("Left the source tenant; the profile is handed over. After the restart, sign in with the local admin account, " +
+            "open Settings > Accounts > Access work or school > Connect > Join this device to Microsoft Entra ID, and sign in as $($plan.destUser.upn) (or a destination admin). " +
+            "Then sign out: $($plan.destUser.upn) signs in to their own desktop. dolop finishes automatically within 10 minutes of the join.")
+        Invoke-Native 'shutdown.exe' @('/r', '/t', '60', '/c', 'This device is leaving your old organisation and will restart in one minute. Your IT team will then connect it to your new organisation.') | Out-Null
+        return
+    }
+
     if (-not $ctx.DestJoined) {
         # --- Join the destination tenant ---
         $pkg = Join-Path $Root 'package.ppkg'
@@ -802,17 +847,44 @@ function Invoke-MigrateMode {
 
 function Invoke-PostJoinMode {
     $attemptsFile = Join-Path $Root 'postjoin-attempts'
-    $attempt = 1
-    if (Test-Path $attemptsFile) { $attempt = 1 + [int]((Get-Content $attemptsFile -Raw).Trim()) }
-    Set-Content -Path $attemptsFile -Value $attempt
+    $manualFile = Join-Path $Root 'manual-join'
+    $manual = $ManualJoin -or (Test-Path $manualFile)
+
+    if ($manual) {
+        # Polled every 10 minutes: cheap local check first, quietly wait until someone joins.
+        $d = Get-Dsreg
+        if ((Get-DsregValue $d 'AzureAdJoined') -ne 'YES') {
+            $since = Get-Date
+            try { $since = [datetime]::Parse((Get-Content $manualFile -Raw).Trim()) } catch { }
+            if (((Get-Date) - $since).TotalDays -ge $ManualJoinDays) {
+                Remove-AgentTask $TaskPostJoin
+                Send-Report -Phase 'postjoin' -Step 'verify' -Status 'fail' -Detail "Nobody joined the device to the destination tenant within $ManualJoinDays days. Join it in Settings, then mark it done in dolop."
+                exit 1
+            }
+            Write-Log 'Waiting for the device to be joined to the destination tenant by hand'
+            exit 0
+        }
+    } else {
+        $attempt = 1
+        if (Test-Path $attemptsFile) { $attempt = 1 + [int]((Get-Content $attemptsFile -Raw).Trim()) }
+        Set-Content -Path $attemptsFile -Value $attempt
+    }
 
     $plan = $null
-    for ($i = 0; $i -lt 30 -and $null -eq $plan; $i++) {
+    $tries = if ($manual) { 3 } else { 30 }
+    for ($i = 0; $i -lt $tries -and $null -eq $plan; $i++) {
         try { $plan = Get-Plan } catch { Start-Sleep -Seconds 20 }
     }
-    if ($null -eq $plan) { Write-Log 'dolop is unreachable; will retry at next start-up' 'ERROR'; exit 1 }
+    if ($null -eq $plan) { Write-Log 'dolop is unreachable; will retry later' 'ERROR'; exit 1 }
 
-    if (-not (Wait-Join $plan.destTenantId 300)) {
+    if ($manual) {
+        if (-not (Wait-Join $plan.destTenantId 30)) {
+            $d = Get-Dsreg
+            Remove-AgentTask $TaskPostJoin
+            Send-Report -Phase 'postjoin' -Step 'verify' -Status 'fail' -Detail "The device was joined to a different tenant ($(Get-DsregValue $d 'TenantId')), not the destination."
+            exit 1
+        }
+    } elseif (-not (Wait-Join $plan.destTenantId 300)) {
         $detail = "Not joined to the destination tenant after restart (attempt $attempt)."
         if ($attempt -ge 3) { Remove-AgentTask $TaskPostJoin; $detail += ' Giving up: join it manually in Settings.' }
         Send-Report -Phase 'postjoin' -Step 'verify' -Status 'fail' -Detail $detail
@@ -846,7 +918,7 @@ function Invoke-PostJoinMode {
 
     Remove-AgentTask $TaskPostJoin
     # The package carries the destination enrollment token; the token is spent.
-    Remove-Item -Path (Join-Path $Root 'package.ppkg'), $attemptsFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path (Join-Path $Root 'package.ppkg'), $attemptsFile, $manualFile -Force -ErrorAction SilentlyContinue
     Send-Report -Phase 'postjoin' -Step 'done' -Status 'done' -Detail ('Migration complete. ' + ($notes -join '; ')) -BitLocker $bl.Keys
     Remove-Item -Path (Join-Path $Root 'token') -Force -ErrorAction SilentlyContinue
 }

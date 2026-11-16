@@ -278,6 +278,7 @@ export type DeviceStatus =
   | 'check_failed'
   | 'scheduled'
   | 'migrating'
+  | 'awaiting_join'
   | 'joined'
   | 'completed'
   | 'failed'

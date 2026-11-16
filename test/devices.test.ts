@@ -41,13 +41,13 @@ describe('planning', () => {
     expect(suggestPlan({ ...base, os: 'Windows', trustType: 'AzureAd', inventory: { accountEnabled: false } })).toBe('cleanup');
   });
 
-  it('blocks readiness on hybrid devices, missing users and a missing package', () => {
+  it('blocks readiness on hybrid devices and missing users; a missing package only means a manual join', () => {
     const device = {
       os: 'Windows', trustType: 'ServerAd', lastActivityAt: recent, bitlockerCount: 0, plan: 'migrate',
     } as Device;
     const checks = deviceReadiness(device, undefined, { packageAvailable: false });
     const byName = Object.fromEntries(checks.map((c) => [c.name, c.status]));
-    expect(byName).toMatchObject({ platform: 'fail', user: 'fail', package: 'fail', agent_check: 'pending' });
+    expect(byName).toMatchObject({ platform: 'fail', user: 'fail', package: 'warn', agent_check: 'pending' });
     expect(isReady(checks)).toBe(false);
   });
 });
@@ -64,6 +64,10 @@ describe('agent report status rules', () => {
     expect(statusForReport('migrating', { phase: 'migrate', step: 'joined', status: 'ok' })).toBe('joined');
     expect(statusForReport('joined', { phase: 'migrate', step: 'restart', status: 'info' })).toBeNull();
     expect(statusForReport('joined', { phase: 'postjoin', step: 'done', status: 'done' })).toBe('completed');
+    expect(statusForReport('migrating', { phase: 'migrate', step: 'awaiting_join', status: 'ok' })).toBe('awaiting_join');
+    expect(statusForReport('awaiting_join', { phase: 'migrate', step: 'restart', status: 'info' })).toBeNull();
+    expect(statusForReport('awaiting_join', { phase: 'check', status: 'done', checks: [] })).toBeNull();
+    expect(statusForReport('awaiting_join', { phase: 'postjoin', step: 'done', status: 'done' })).toBe('completed');
     expect(statusForReport('migrating', { phase: 'migrate', ...fail })).toBe('failed');
     expect(statusForReport('completed', { phase: 'migrate', ...fail })).toBeNull();
   });
@@ -224,8 +228,8 @@ describe('device migration API', () => {
     const go = await byName('LAPTOP-GO-01');
     const dev = `/api/projects/${projectId}/devices/${go.id}`;
 
-    // No package yet: readiness blocks, but a command can already be created for a check.
-    expect(go.readiness.find((c: any) => c.name === 'package').status).toBe('fail');
+    // No package yet: the device would be joined by hand.
+    expect(go.readiness.find((c: any) => c.name === 'package').status).toBe('warn');
     const pkgBytes = new TextEncoder().encode('fake ppkg bytes').buffer as ArrayBuffer;
     const bad = await call(t, 'PUT', `/api/projects/${projectId}/devices/package?filename=x.zip`, pkgBytes);
     expect(bad.status).toBe(400);
@@ -238,6 +242,7 @@ describe('device migration API', () => {
     const issued = await call(t, 'POST', `${dev}/agent`, {});
     expect(issued.status, JSON.stringify(issued.body)).toBe(200);
     const token: string = issued.body.token;
+    expect(issued.body.joinMode).toBe('package');
     expect(issued.body.commands.check).toContain(token);
     expect(issued.body.commands.check).toContain(`$s = '${ORIGIN}'`);
     expect(t.db.rows('SELECT agent_token_hash FROM devices WHERE id = ?', go.id)[0]).not.toMatchObject({ agent_token_hash: token });
@@ -256,6 +261,7 @@ describe('device migration API', () => {
       sourceUser: { upn: 'ada@src.test', sid: entraSidFromObjectId(SRC_OBJECT_ID) },
       destUser: { upn: 'ada@dst.test', sid: DEST_SID },
       package: { available: true, size: 15 },
+      joinMode: 'package',
     });
     const pkg = await agentCall(t, token, 'GET', '/api/agent/package');
     expect(pkg.body.text).toBe('fake ppkg bytes');
@@ -291,6 +297,27 @@ describe('device migration API', () => {
     expect(clean.body.deleted).toEqual(['Intune record', 'Entra ID device']);
     expect(deleted).toEqual(expect.arrayContaining(['deviceManagement/managedDevices/md-1', 'devices/obj-1']));
     expect((await byName('LAPTOP-GO-01')).status).toBe('cleaned_up');
+  });
+
+  it('falls back to a manual join when no provisioning package is uploaded', async () => {
+    await discover();
+    const go = await byName('LAPTOP-GO-01');
+    const issued = await call(t, 'POST', `/api/projects/${projectId}/devices/${go.id}/agent`, {});
+    expect(issued.body.joinMode).toBe('manual');
+    const token: string = issued.body.token;
+
+    const plan = await agentCall(t, token, 'GET', '/api/agent/plan');
+    expect(plan.body).toMatchObject({ joinMode: 'manual', package: { available: false } });
+    expect((await agentCall(t, token, 'GET', '/api/agent/package')).status).toBe(404);
+
+    const report = (body: unknown) => agentCall(t, token, 'POST', '/api/agent/report', body);
+    await report({ phase: 'check', step: 'preflight', status: 'done', checks: [{ name: 'join', status: 'warn', detail: 'Manual join' }] });
+    expect(await byName('LAPTOP-GO-01')).toMatchObject({ status: 'checked', ready: true });
+    await report({ phase: 'migrate', step: 'left_source', status: 'ok' });
+    await report({ phase: 'migrate', step: 'awaiting_join', status: 'ok', detail: 'Left the source tenant' });
+    expect((await byName('LAPTOP-GO-01')).status).toBe('awaiting_join');
+    await report({ phase: 'postjoin', step: 'done', status: 'done', detail: 'Migration complete.' });
+    expect((await byName('LAPTOP-GO-01')).status).toBe('completed');
   });
 
   it('refuses agent commands for unmapped devices and missing destination accounts', async () => {
